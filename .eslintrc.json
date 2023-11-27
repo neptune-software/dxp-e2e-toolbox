@@ -11,7 +11,7 @@
     ],
     "parser": "@typescript-eslint/parser",
     "parserOptions": {
-      "project": "tsconfig.eslint.json",
+      "project": "tsconfig.esm.json",
       "sourceType": "module"
     },
     "plugins": [

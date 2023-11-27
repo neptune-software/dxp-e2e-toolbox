@@ -1,5 +1,5 @@
-import { App } from "../common/app";
+import {App} from "../common/app";
 
 export class AppOpenEdition extends App {
- 
+
 }

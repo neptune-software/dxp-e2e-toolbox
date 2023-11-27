@@ -1,16 +1,15 @@
-import { App, AppOpenOptions } from "../common/app";
-import { DxpEditionType } from "../common/types";
+import {App} from "../common/app";
+import {DxpEditionType} from "../common/types";
+import {SapEditionBuildUrlAppOptions} from "./urlhelper";
 
-export interface AppOpenOptionsSapEdition extends Omit<AppOpenOptions, 'dxpEditionType'> {
-
-}
+export type AppOpenOptionsSapEdition = Omit<SapEditionBuildUrlAppOptions, "dxpEditionType">;
 
 export class AppSapEdition extends App {
-    static async open(options: AppOpenOptionsSapEdition): Promise<App> {
-        return App.open({
-          ...options,
-          dxpEditionType: DxpEditionType.sapEdition,
-        });
-    
-      }
+  static async open(options: AppOpenOptionsSapEdition): Promise<App> {
+    return App.open({
+      ...options,
+      dxpEditionType: DxpEditionType.sapEdition,
+    });
+
+  }
 }

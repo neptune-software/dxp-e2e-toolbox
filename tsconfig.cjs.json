@@ -5,7 +5,8 @@
     "outDir": "./dist/cjs",
     "target": "ES2018",
     "moduleResolution": "node",
-    "declaration": true
+    "declaration": true,
+    "inlineSourceMap":true
   },
   "include": [
     "src/**/*", 
