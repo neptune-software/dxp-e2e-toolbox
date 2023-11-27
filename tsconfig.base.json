@@ -1,0 +1,21 @@
+{
+    "compilerOptions": {
+      "strict": true,
+      "esModuleInterop": true,
+      "forceConsistentCasingInFileNames": true,
+      "noImplicitReturns": true,
+      "noFallthroughCasesInSwitch": true,
+      "noUnusedLocals": true,
+      "noUnusedParameters": true,
+      "resolveJsonModule": true,
+      "skipLibCheck": true,
+      "types": [
+        "node", 
+        "expect-webdriverio",
+        "@wdio/globals/types",  
+      ],
+    },
+    "exclude": ["node_modules", "dist"],
+
+  }
+  

@@ -1,0 +1,9 @@
+src/*
+examples/*
+test/* 
+*.json
+*.log 
+npm-debug.log
+.env
+tsconfig.eslint.json 
+.vscode/*
