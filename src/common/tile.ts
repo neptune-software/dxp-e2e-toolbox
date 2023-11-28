@@ -1,4 +1,4 @@
-import {Launchpad} from "./launchpad";
+import {CloseTileConfig, Launchpad} from "./launchpad";
 import {DxpEditionType} from "./types";
 
 export interface TileConstructorConfig {
@@ -11,6 +11,8 @@ export class Tile {
   public readonly launchpad: Launchpad;
 
   public readonly tileData: any;
+
+  public isOpened: boolean = false;
 
   constructor(options: TileConstructorConfig) {
 
@@ -29,6 +31,15 @@ export class Tile {
         tileModule = await import("../open-edition/tile");
         return new tileModule.TileOpenEdition(options);
     }
+  }
+
+  public async close(config?: CloseTileConfig): Promise<Tile> {
+    await this.launchpad.closeTile({
+      tileData: this.tileData,
+      config: config,
+    });
+    this.isOpened = false;
+    return this;
   }
 
 }

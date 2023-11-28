@@ -13,7 +13,7 @@ export interface PincodeOptions {
 }
 
 export interface LaunchpadContstructorConfig extends PageContstructorConfig {
-    /** Name of the Launchpad */
+  /** Name of the Launchpad */
   launchpadName: string,
 
   isPwa?: boolean;
@@ -31,6 +31,18 @@ export interface GetTileDataOptions {
   NAME?: string,
   APPLID?: string,
 }
+
+export interface CloseTileConfig {
+  forceClose?: boolean;
+  restrictedEnable?: boolean;
+  restrictedType?: string;
+}
+
+export interface CloseTileOptions extends GetTileDataOptions {
+  tileData?: any;
+  config?: CloseTileConfig;
+}
+
 export class Launchpad extends Page {
 
   public readonly launchpadName: string;
@@ -72,10 +84,10 @@ export class Launchpad extends Page {
 
   }
 
-    /**
-     * @description Get Data of a Tile
-     * @param options Get Tile Data by NAME, GUID, or APPLID
-     */
+  /**
+   * @description Get Data of a Tile
+   * @param options Get Tile Data by NAME, GUID, or APPLID
+   */
   public async getTileData(options: GetTileDataOptions): Promise<any> {
     let getTileDataScript = "";
     if (options.GUID) {
@@ -95,11 +107,11 @@ export class Launchpad extends Page {
     }
   }
 
-    /**
-     * @description Opening a Tile in the Launchpad. It will call function
-     * sap.n.Launchpad.HandleTilePress that requires to pass the corresponding GUID of the tile
-     * @param  options Get Tile Data by NAME, GUID, or APPLID
-     */
+  /**
+   * @description Opening a Tile in the Launchpad. It will call function
+   * sap.n.Launchpad.HandleTilePress that requires to pass the corresponding GUID of the tile
+   * @param  options Get Tile Data by NAME, GUID, or APPLID
+   */
   public async openTile(options: GetTileDataOptions): Promise<Tile> {
     await this.browser.pause(500);
     const tileData = await this.getTileData(options);
@@ -111,6 +123,35 @@ export class Launchpad extends Page {
       launchpad: this,
       tileData: tileData,
     });
+    tile.isOpened = true;
+    return tile;
+  }
+
+  /**
+   * @description Closing an opened Tile in the Launchpad. It will call function
+   * sap.n.Shell.closeTile that requires to pass the corresponding GUID of the tile
+   * @param  options Get Tile Data by NAME, GUID, or APPLID
+   */
+  public async closeTile(options: CloseTileOptions): Promise<Tile> {
+    await this.browser.pause(500);
+
+    let tileData;
+
+    if (options.tileData) {
+      tileData = options.tileData;
+    } else {
+      tileData = await this.getTileData(options);
+    }
+
+    const openTileScript = `sap.n.Shell.closeTile(arguments[0],arguments[1]);`;
+
+    await this.browser.executeScript(openTileScript, [tileData, options.config]);
+
+    const tile = await Tile.getInstance({
+      launchpad: this,
+      tileData: tileData,
+    });
+    tile.isOpened = false;
     return tile;
   }
 
