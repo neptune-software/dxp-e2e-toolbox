@@ -1,20 +1,23 @@
 {
   "name": "@neptune-software/dxp-e2e-toolbox",
-  "version": "0.0.3",
-  "description": "Neptune DXP E2E Toolbox",
+  "version": "1.0.0",
+  "description": "Neptune DXP E2E Toolbox - A robust, version-aware factory-based library for Neptune DXP end-to-end testing",
+  "type": "module",
   "main": "dist/cjs/index.js",
   "module": "dist/esm/index.js",
   "exports": {
     ".": {
       "require": "./dist/cjs/index.js",
-      "import": "./dist/esm/index.js"
+      "import": "./dist/esm/index.js",
+      "types": "./dist/esm/index.d.ts"
     }
-  }, 
+  },
   "types": "dist/esm/index.d.ts",
-  "scripts": {  
+  "scripts": {
     "build": "npm run build:cjs && npm run build:esm",
     "build:cjs": "tsc -p tsconfig.cjs.json",
-    "build:esm": "tsc -p tsconfig.esm.json"
+    "build:esm": "tsc -p tsconfig.esm.json",
+    "clean": "rimraf dist"
   },
   "repository": {
     "type": "git",
@@ -27,15 +30,29 @@
   },
   "homepage": "https://github.com/neptune-software/dxp-e2e-toolbox#readme",
   "peerDependencies": {
-    "@wdio/cli": "^9",
-    "wdio-ui5-service": "^3"
+    "webdriverio": "^9",
+    "wdio-ui5-service": "^3",
+    "expect-webdriverio": "^5"
   },
-  
-  "devDependencies": {  
-    "@wdio/cli": "^9.23.3",    
-    "typescript": "^5.9.3" 
+  "devDependencies": {
+    "@wdio/cli": "^9.23.3",
+    "@wdio/types": "^9.23.3",
+    "expect-webdriverio": "^5.6.4",
+    "typescript": "^5.9.3",
+    "webdriverio": "^9.23.3",
+    "wdio-ui5-service": "^3.0.8"
   },
   "engines": {
     "node": ">=20"
-  }
+  },
+  "keywords": [
+    "neptune",
+    "dxp",
+    "e2e",
+    "testing",
+    "webdriverio",
+    "wdi5",
+    "ui5",
+    "sap"
+  ]
 }

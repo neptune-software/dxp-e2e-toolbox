@@ -10,9 +10,11 @@
       "resolveJsonModule": true,
       "skipLibCheck": true,
       "types": [
-        "node", 
+        "node",
+        "webdriverio",
         "expect-webdriverio",
-        "@wdio/globals/types",  
+        "@wdio/globals/types",
+        "wdio-ui5-service"
       ],
     },
     "exclude": ["node_modules", "dist"],
