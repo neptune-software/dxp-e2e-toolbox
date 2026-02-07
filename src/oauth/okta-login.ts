@@ -8,6 +8,9 @@
  * - Auto-submit scenarios (Okta may auto-submit after password entry)
  */
 
+/// <reference types="webdriverio" />
+/// <reference types="@wdio/globals/types" />
+
 import { BaseOAuthProvider } from "./oauth-provider.js";
 import { OAuthLoginOptions, WindowHandleInfo } from "../core/types.js";
 
@@ -85,18 +88,35 @@ export class OktaLogin extends BaseOAuthProvider {
   private async waitForPageReady(): Promise<void> {
     console.log("[OktaLogin] Waiting for page to be ready...");
     
-    // Wait for document.readyState to be complete
-    await this.browser.waitUntil(
-      async () => {
-        try {
-          const readyState = await this.browser.execute(() => document.readyState);
-          return readyState === "complete";
-        } catch {
-          return false;
+    // Brief pause to let the context switch stabilize (especially important for iOS Safari)
+    await this.browser.pause(1000);
+    
+    // Wait for document.readyState to be complete with retry logic
+    let readyStateAttempts = 0;
+    const maxReadyStateAttempts = 3;
+    
+    while (readyStateAttempts < maxReadyStateAttempts) {
+      try {
+        await this.browser.waitUntil(
+          async () => {
+            try {
+              const readyState = await this.browser.execute(() => document.readyState);
+              return readyState === "complete" || readyState === "interactive";
+            } catch {
+              return false;
+            }
+          },
+          { timeout: OKTA_TIMEOUTS.pageLoad / maxReadyStateAttempts, interval: OKTA_TIMEOUTS.interval }
+        );
+        break; // Success
+      } catch {
+        readyStateAttempts++;
+        if (readyStateAttempts < maxReadyStateAttempts) {
+          console.log(`[OktaLogin] Page ready check failed, retrying (attempt ${readyStateAttempts + 1}/${maxReadyStateAttempts})...`);
+          await this.browser.pause(500);
         }
-      },
-      { timeout: OKTA_TIMEOUTS.pageLoad, interval: OKTA_TIMEOUTS.interval }
-    );
+      }
+    }
 
     // Wait for Okta loading spinner to disappear (if present)
     try {
@@ -113,17 +133,44 @@ export class OktaLogin extends BaseOAuthProvider {
       // Spinner not present, continue
     }
 
-    // Wait for form container to be visible
+    // Wait for form container OR any form input to be visible (more flexible)
+    // This handles cases where Okta's DOM structure varies
+    console.log("[OktaLogin] Waiting for form elements...");
     await this.browser.waitUntil(
       async () => {
         try {
+          // Check for form container
           const container = await this.browser.$(OKTA_SELECTORS.formContainer);
-          return await container.isDisplayed();
+          if (await container.isDisplayed()) {
+            return true;
+          }
         } catch {
-          return false;
+          // Continue to check other elements
         }
+        
+        try {
+          // Check for username input (main form element)
+          const usernameInput = await this.browser.$(OKTA_SELECTORS.inputIdentifier);
+          if (await usernameInput.isDisplayed()) {
+            return true;
+          }
+        } catch {
+          // Continue
+        }
+        
+        try {
+          // Check for classic username input
+          const classicInput = await this.browser.$(OKTA_SELECTORS.inputIdentifierClassic);
+          if (await classicInput.isDisplayed()) {
+            return true;
+          }
+        } catch {
+          // Continue
+        }
+        
+        return false;
       },
-      { timeout: OKTA_TIMEOUTS.element, interval: OKTA_TIMEOUTS.interval }
+      { timeout: OKTA_TIMEOUTS.pageLoad, interval: OKTA_TIMEOUTS.interval }
     );
 
     console.log("[OktaLogin] Page is ready");

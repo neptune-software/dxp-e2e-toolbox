@@ -62,3 +62,4 @@ export { LaunchpadOpenEdition } from "./open-edition/launchpad.js";
 export { AzureLogin } from "./oauth/azure-login.js";
 export { OktaLogin } from "./oauth/okta-login.js";
 export { BtpIasLogin } from "./oauth/btp-ias-login.js";
+export { OAuthFlowManager, type OAuthProvider, type OAuthCredentials } from "./helpers/oauth-flow-manager.js";

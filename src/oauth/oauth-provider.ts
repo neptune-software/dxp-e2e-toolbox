@@ -3,6 +3,9 @@
  * Provides common functionality for window handling and login flows.
  */
 
+/// <reference types="webdriverio" />
+/// <reference types="@wdio/globals/types" />
+
 import { Environment } from "../core/environment.js";
 import { OAuthError } from "../core/errors.js";
 import { OAuthProvider as OAuthProviderType, OAuthLoginOptions, WindowHandleInfo } from "../core/types.js";
@@ -70,7 +73,7 @@ export abstract class BaseOAuthProvider {
    */
   protected async waitAndClick(
     selector: string,
-    timeout = DEFAULT_TIMEOUTS.medium
+    timeout: number = DEFAULT_TIMEOUTS.medium
   ): Promise<void> {
     const element = await this.waitForElement(selector, timeout);
     await element.click();

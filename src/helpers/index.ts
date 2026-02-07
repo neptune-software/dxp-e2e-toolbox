@@ -31,3 +31,15 @@ export {
 
 // Gesture utilities
 export * from "./gestures.js";
+
+// OAuth Flow Manager - unified OAuth handling
+export {
+  OAuthFlowManager,
+  type OAuthProvider,
+  type OAuthBrowserMode,
+  type OAuthCredentials,
+  type PerformOAuthLoginOptions,
+  type OAuthLoginResult,
+  type IsOAuthPageCallback,
+  type CustomLoginHandler,
+} from "./oauth-flow-manager.js";
