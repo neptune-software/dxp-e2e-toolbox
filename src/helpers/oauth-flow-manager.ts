@@ -1108,17 +1108,17 @@ export class OAuthFlowManager {
     
     // iOS: Clear any blocking dialogs AGGRESSIVELY
     if (this.isIOS()) {
-      console.log(`[OAuthFlowManager] iOS: Clearing dialogs before webview switch...`);
-      for (let attempt = 0; attempt < 5; attempt++) {
-        try {
-          await this.browser.acceptAlert();
-          console.log(`[OAuthFlowManager] iOS: Cleared dialog ${attempt + 1}`);
-          await this.browser.pause(500);
-        } catch {
-          // No more dialogs
-          break;
-        }
-      }
+      // console.log(`[OAuthFlowManager] iOS: Clearing dialogs before webview switch...`);
+      // for (let attempt = 0; attempt < 5; attempt++) {
+      //   try {
+      //     await this.browser.acceptAlert();
+      //     console.log(`[OAuthFlowManager] iOS: Cleared dialog ${attempt + 1}`);
+      //     await this.browser.pause(500);
+      //   } catch {
+      //     // No more dialogs
+      //     break;
+      //   }
+      // }
       // Additional wait for iOS after dialog handling
       await this.browser.pause(1000);
     }
@@ -1193,68 +1193,131 @@ export class OAuthFlowManager {
     // iOS: One more dialog check before wdi5 injection
     if (this.isIOS()) {
       try {
-        await this.browser.acceptAlert();
-        console.log(`[OAuthFlowManager] iOS: Cleared late dialog`);
+       // await this.browser.acceptAlert();
+       // console.log(`[OAuthFlowManager] iOS: Cleared late dialog`);
         await this.browser.pause(500);
       } catch {
         // No dialog
       }
     }
     
-    // iOS: "Warm up" the webview connection with simple execute calls
-    // This helps reset any corrupted state from Safari
+    // iOS: Aggressive recovery to reset corrupted Safari Remote Debugger state
+    // The Safari debugger connection gets corrupted after external Safari closes
     if (this.isIOS()) {
-      console.log(`[OAuthFlowManager] iOS: Warming up webview connection...`);
-      for (let attempt = 0; attempt < 3; attempt++) {
+      console.log(`[OAuthFlowManager] iOS: Starting aggressive webview recovery...`);
+      
+      // Step 1: Multiple context switches to reset WebDriver state
+      for (let i = 0; i < 2; i++) {
         try {
-          // Simple sync execute to test the connection
-          const result = await this.browser.execute(() => {
-            return document.readyState;
-          });
-          console.log(`[OAuthFlowManager] iOS: Webview ready (attempt ${attempt + 1}): ${result}`);
-          break;
+          await this.browser.switchContext("NATIVE_APP");
+          await this.browser.pause(500);
+          await this.browser.switchContext(targetWebview);
+          await this.browser.pause(500);
         } catch (e) {
-          console.log(`[OAuthFlowManager] iOS: Warmup attempt ${attempt + 1} failed: ${e}`);
-          await this.browser.pause(1000);
-          
-          // Try clearing any dialogs
-          try { await this.browser.acceptAlert(); } catch { /* ignore */ }
+          console.log(`[OAuthFlowManager] iOS: Context reset ${i + 1}: ${e}`);
         }
       }
+      
+      // Step 2: Clear any lingering dialogs
+      for (let i = 0; i < 3; i++) {
+        try { await this.browser.acceptAlert(); await this.browser.pause(300); } catch { break; }
+      }
+      
+      // Step 3: Multiple warmup execute calls to re-establish debugger connection
+      console.log(`[OAuthFlowManager] iOS: Warming up Safari debugger connection...`);
+      let warmupSuccess = false;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          // Use multiple simple sync execute calls to "prime" the connection
+          await this.browser.execute(() => true);
+          await this.browser.execute(() => document.readyState);
+          await this.browser.execute(() => window.location.href);
+          const hasSap = await this.browser.execute(() => typeof (window as any).sap !== "undefined");
+          console.log(`[OAuthFlowManager] iOS: Warmup ${attempt + 1} succeeded, hasSap=${hasSap}`);
+          warmupSuccess = true;
+          break;
+        } catch (e) {
+          console.log(`[OAuthFlowManager] iOS: Warmup ${attempt + 1} failed: ${e}`);
+          await this.browser.pause(1500);
+          
+          // Try context reset on failure
+          try {
+            await this.browser.switchContext("NATIVE_APP");
+            await this.browser.pause(300);
+            try { await this.browser.acceptAlert(); } catch { /* ignore */ }
+            await this.browser.switchContext(targetWebview);
+            await this.browser.pause(500);
+          } catch { /* ignore */ }
+        }
+      }
+      
+      if (!warmupSuccess) {
+        console.error(`[OAuthFlowManager] iOS: Warmup failed after all attempts!`);
+      }
+      
+      // Step 4: Extra stabilization wait
+      await this.browser.pause(1000);
     }
     
     // Re-inject wdi5 - CRITICAL for UI5 interactions after OAuth
     console.log(`[OAuthFlowManager] Re-injecting wdi5...`);
     let wdi5Injected = false;
     
-    for (let attempt = 0; attempt < 3; attempt++) {
+    // iOS needs more attempts and longer delays due to Safari debugger instability
+    const maxAttempts = this.isIOS() ? 5 : 3;
+    const retryDelay = this.isIOS() ? 3000 : 2000;
+    
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
+        // iOS: One more warmup check before each injection attempt
+        if (this.isIOS() && attempt > 0) {
+          console.log(`[OAuthFlowManager] iOS: Pre-injection warmup for attempt ${attempt + 1}...`);
+          try {
+            await this.browser.execute(() => true);
+            await this.browser.execute(() => document.readyState);
+          } catch (warmupErr) {
+            console.log(`[OAuthFlowManager] iOS: Pre-injection warmup failed: ${warmupErr}`);
+            // Continue anyway, the actual injection might work
+          }
+        }
+        
         await this.browser.injectUI5();
         await this.browser.pause(TIMEOUTS.postInjection);
         console.log(`[OAuthFlowManager] wdi5 injected successfully (attempt ${attempt + 1})`);
         wdi5Injected = true;
         break;
       } catch (e) {
-        console.error(`[OAuthFlowManager] wdi5 injection attempt ${attempt + 1} failed: ${e}`);
+        console.error(`[OAuthFlowManager] wdi5 injection attempt ${attempt + 1}/${maxAttempts} failed: ${e}`);
         
-        if (attempt < 2) {
-          // Wait and retry
-          await this.browser.pause(2000);
+        if (attempt < maxAttempts - 1) {
+          // Wait longer between retries
+          console.log(`[OAuthFlowManager] Waiting ${retryDelay}ms before retry...`);
+          await this.browser.pause(retryDelay);
           
-          // iOS: Try switching context back and forth to reset state
-          if (this.isIOS()) {
+          // iOS: Aggressive context reset between attempts
+          if (this.isIOS() && targetWebview) {
             try {
-              console.log(`[OAuthFlowManager] iOS: Resetting context...`);
+              console.log(`[OAuthFlowManager] iOS: Full context reset before retry...`);
+              
+              // Switch to NATIVE_APP
               await this.browser.switchContext("NATIVE_APP");
               await this.browser.pause(500);
               
-              // Clear dialogs
-              try { await this.browser.acceptAlert(); } catch { /* ignore */ }
+              // Clear any dialogs
+              for (let d = 0; d < 3; d++) {
+                try { await this.browser.acceptAlert(); await this.browser.pause(200); } catch { break; }
+              }
               
               // Switch back to webview
-              if (targetWebview) {
-                await this.browser.switchContext(targetWebview);
-                await this.browser.pause(500);
+              await this.browser.switchContext(targetWebview);
+              await this.browser.pause(1000);
+              
+              // Try to verify we can execute in this context
+              try {
+                const ready = await this.browser.execute(() => document.readyState);
+                console.log(`[OAuthFlowManager] iOS: Context reset successful, readyState=${ready}`);
+              } catch (execErr) {
+                console.log(`[OAuthFlowManager] iOS: Post-reset execute failed: ${execErr}`);
               }
             } catch (ctxErr) {
               console.log(`[OAuthFlowManager] iOS: Context reset failed: ${ctxErr}`);
@@ -1265,8 +1328,39 @@ export class OAuthFlowManager {
     }
     
     if (!wdi5Injected) {
-      console.error(`[OAuthFlowManager] WARNING: wdi5 injection failed after all attempts!`);
+      console.error(`[OAuthFlowManager] WARNING: wdi5 injection failed after ${maxAttempts} attempts!`);
       console.error(`[OAuthFlowManager] UI5 controls may not work properly.`);
+      
+      // iOS: Last resort - try a simple fallback approach
+      if (this.isIOS()) {
+        console.log(`[OAuthFlowManager] iOS: Attempting fallback wdi5 setup...`);
+        try {
+          // Wait for page to be fully loaded
+          await this.browser.pause(2000);
+          
+          // Check if UI5 is already available
+          const hasUI5 = await this.browser.execute(() => {
+            return typeof (window as any).sap !== "undefined" && 
+                   typeof (window as any).sap.ui !== "undefined";
+          });
+          
+          if (hasUI5) {
+            console.log(`[OAuthFlowManager] iOS: UI5 is present, attempting direct bridge injection...`);
+            // Try one more time after confirming UI5 is there
+            try {
+              await this.browser.injectUI5();
+              console.log(`[OAuthFlowManager] iOS: Fallback injection succeeded!`);
+              wdi5Injected = true;
+            } catch (finalErr) {
+              console.error(`[OAuthFlowManager] iOS: Fallback injection also failed: ${finalErr}`);
+            }
+          } else {
+            console.error(`[OAuthFlowManager] iOS: UI5 not present in webview!`);
+          }
+        } catch (fallbackErr) {
+          console.error(`[OAuthFlowManager] iOS: Fallback check failed: ${fallbackErr}`);
+        }
+      }
     }
     
     console.log(`[OAuthFlowManager] Back in app`);

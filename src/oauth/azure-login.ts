@@ -107,6 +107,8 @@ export class AzureLogin extends BaseOAuthProvider {
     // Click sign in with retry
     await this.clickSignInWithRetry();
 
+    this.browser.pause(1000);
+
     // OPTIMIZATION: Check if login has already auto-completed (OAuth page closed)
     // This happens when Azure doesn't show "Stay signed in" and immediately redirects
     // Checking early avoids 20+ second timeouts trying to find elements on a closed page
