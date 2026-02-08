@@ -283,6 +283,9 @@ export class OAuthFlowManager {
   private appContext: Context | null = null;
   private contextsBeforeLogin: string[] = [];
   
+  // Track if OAuth was auto-triggered (dialog cleared = auto-triggered on iOS)
+  private oauthAutoTriggered: boolean = false;
+  
   // Current options (stored for use across methods)
   private currentOptions: PerformOAuthLoginOptions | null = null;
   
@@ -412,8 +415,12 @@ export class OAuthFlowManager {
       // Step 3: Switch to OAuth context
       const loginContext = await this.switchToOAuthContext(timeout, browserMode);
       
-      // Step 4: Perform the actual OAuth login
-      await this.executeOAuthLogin(provider, credentials, sapBasicLoginHandler, customLoginHandler);
+      // Step 4: Perform the actual OAuth login (unless auto-completed)
+      if (String(loginContext) === "OAUTH_AUTO_COMPLETED") {
+        console.log(`[OAuthFlowManager] OAuth auto-completed (SSO/cached credentials)`);
+      } else {
+        await this.executeOAuthLogin(provider, credentials, sapBasicLoginHandler, customLoginHandler);
+      }
       
       // Step 5: Return to app and restore state
       await this.returnToAppAndRestore(browserMode);
@@ -490,33 +497,101 @@ export class OAuthFlowManager {
   
   /**
    * Capture the initial app state before OAuth
+   * 
+   * CRITICAL: For iOS, if we clear a permission dialog here, it means
+   * OAuth was auto-triggered by the app and Safari is now opening.
+   * We MUST NOT try to inject wdi5 and click login button in this case!
    */
   private async captureInitialState(): Promise<void> {
+    // Reset auto-triggered flag at the START
+    this.oauthAutoTriggered = false;
+    
+    // Get contexts BEFORE any dialog handling - this is the original app state
+    try {
+      this.contextsBeforeLogin = await this.browser.getContexts() as string[];
+      console.log(`[OAuthFlowManager] Initial contexts (before dialog check): ${JSON.stringify(this.contextsBeforeLogin)}`);
+    } catch (e) {
+      console.log(`[OAuthFlowManager] Could not get initial contexts: ${e}`);
+      this.contextsBeforeLogin = [];
+    }
+    
+    // Find app webview BEFORE dialog handling - Android has package name, iOS has numeric ID
+    const appWebview = this.contextsBeforeLogin.find(c => {
+      const ctxStr = String(c).toLowerCase();
+      if (!ctxStr.includes("webview")) return false;
+      if (ctxStr.includes("chrome")) return false;
+      if (ctxStr.includes("safari")) return false;
+      if (ctxStr.includes("terrace")) return false;
+      return true;
+    });
+    
+    if (appWebview) {
+      this.appContext = appWebview as Context;
+      console.log(`[OAuthFlowManager] App webview (before OAuth): ${this.appContext}`);
+    } else {
+      try {
+        this.appContext = await this.browser.getContext();
+        console.log(`[OAuthFlowManager] Current context: ${this.appContext}`);
+      } catch (e) {
+        console.log(`[OAuthFlowManager] Could not get current context: ${e}`);
+        this.appContext = null;
+      }
+    }
+    
     // Stabilization pause
     const stabilizationWait = this.isIOS() 
       ? TIMEOUTS.appStabilization.ios 
       : TIMEOUTS.appStabilization.android;
     await this.browser.pause(stabilizationWait);
     
-    this.appContext = await this.browser.getContext();
-    this.contextsBeforeLogin = await this.browser.getContexts() as string[];
+    // iOS: Clear permission dialog - if successful, OAuth was AUTO-TRIGGERED!
+    // This dialog appears when iOS asks "App wants to use example.com to sign in"
+    if (this.isIOS()) {
+      console.log(`[OAuthFlowManager] iOS: Checking for 'wants to sign in' dialog...`);
+      try {
+        await this.browser.acceptAlert();
+        console.log(`[OAuthFlowManager] iOS: *** DIALOG ACCEPTED - OAuth AUTO-TRIGGERED! ***`);
+        this.oauthAutoTriggered = true;
+        // Give Safari time to open
+        await this.browser.pause(2000);
+      } catch {
+        console.log(`[OAuthFlowManager] iOS: No permission dialog found`);
+      }
+    }
     
-    console.log(`[OAuthFlowManager] App context: ${this.appContext}`);
-    console.log(`[OAuthFlowManager] Contexts at start: ${JSON.stringify(this.contextsBeforeLogin)}`);
+    // For Android, check if Chrome webview is already present (means OAuth auto-triggered)
+    if (!this.isIOS()) {
+      const chromePresent = this.contextsBeforeLogin.some(c => 
+        String(c).toUpperCase().includes("CHROME")
+      );
+      if (chromePresent) {
+        console.log(`[OAuthFlowManager] Android: Chrome already present - OAuth AUTO-TRIGGERED!`);
+        this.oauthAutoTriggered = true;
+      }
+    }
   }
   
   /**
    * Detect and handle OAuth trigger (auto vs manual)
    * Returns true if OAuth was auto-triggered
+   * 
+   * IMPORTANT: If oauthAutoTriggered is already true (set in captureInitialState),
+   * we skip all detection and manual login - OAuth browser is already open!
    */
   private async handleOAuthTrigger(
     launchpadName?: string,
     browserMode: OAuthBrowserMode = "native"
   ): Promise<boolean> {
+    // If already detected as auto-triggered in captureInitialState, skip detection
+    if (this.oauthAutoTriggered) {
+      console.log(`[OAuthFlowManager] OAuth was auto-triggered (detected in initial state)`);
+      return true;
+    }
+    
     let autoTriggered = false;
     
     if (browserMode === "native") {
-      // Native browser mode - check for dialogs/auto-trigger
+      // Native browser mode - do a final check for dialogs/new browser
       if (this.isIOS()) {
         autoTriggered = await this.handleIOSNativeOAuthTrigger();
       } else {
@@ -529,8 +604,10 @@ export class OAuthFlowManager {
     
     // If not auto-triggered, we need to manually trigger OAuth
     if (!autoTriggered && launchpadName) {
-      console.log(`[OAuthFlowManager] Manual login mode - triggering OAuth...`);
+      console.log(`[OAuthFlowManager] Manual login mode - triggering OAuth via login button...`);
       await this.triggerManualLogin(launchpadName);
+    } else if (!autoTriggered && !launchpadName) {
+      console.log(`[OAuthFlowManager] WARNING: Not auto-triggered but no launchpadName provided for manual login`);
     }
     
     return autoTriggered;
@@ -538,53 +615,71 @@ export class OAuthFlowManager {
   
   /**
    * Handle iOS native OAuth trigger detection (Safari)
+   * 
+   * Returns true if OAuth was auto-triggered (Safari opened automatically).
+   * Note: This is called AFTER captureInitialState, which already checks for dialog.
    */
   private async handleIOSNativeOAuthTrigger(): Promise<boolean> {
-    console.log(`[OAuthFlowManager] iOS: Checking for permission dialog...`);
+    // Already checked in captureInitialState, but flag not set means no dialog was found
+    console.log(`[OAuthFlowManager] iOS: Final check for Safari dialog...`);
     
-    // Try to accept permission dialog (indicates auto-login)
-    for (let attempt = 0; attempt < 5; attempt++) {
-      try {
-        await this.browser.acceptAlert();
-        console.log(`[OAuthFlowManager] iOS: Accepted permission dialog - OAuth auto-triggered!`);
-        await this.browser.pause(1000);
-        return true;
-      } catch {
-        if (attempt < 4) {
-          await this.browser.pause(500);
-        }
-      }
+    // One quick attempt - if there's a late dialog, clear it
+    try {
+      await this.browser.acceptAlert();
+      console.log(`[OAuthFlowManager] iOS: Late dialog cleared - OAuth auto-triggered!`);
+      this.oauthAutoTriggered = true;
+      await this.browser.pause(2000);
+      return true;
+    } catch {
+      // No dialog
     }
     
-    console.log(`[OAuthFlowManager] iOS: No permission dialog - manual login mode`);
+    // Also check if Safari is already open (Cancel button visible)
+    try {
+      await this.browser.switchContext("NATIVE_APP");
+      const cancelButton = await this.browser.$('//XCUIElementTypeButton[@name="Cancel"]');
+      const safariOpen = await cancelButton.isExisting().catch(() => false);
+      
+      if (safariOpen) {
+        console.log(`[OAuthFlowManager] iOS: Safari already open (Cancel visible) - OAuth auto-triggered!`);
+        this.oauthAutoTriggered = true;
+        return true;
+      }
+    } catch (e) {
+      console.log(`[OAuthFlowManager] iOS: Safari check failed: ${e}`);
+    }
+    
+    console.log(`[OAuthFlowManager] iOS: No auto-trigger detected - manual login required`);
     return false;
   }
   
   /**
    * Handle Android native OAuth trigger detection (Chrome)
+   * 
+   * Returns true if OAuth was auto-triggered (Chrome opened automatically).
+   * Note: captureInitialState already checks if Chrome was present at start.
    */
   private async handleAndroidNativeOAuthTrigger(): Promise<boolean> {
     console.log(`[OAuthFlowManager] Android: Checking for Chrome webview...`);
-    await this.browser.pause(2000);
+    
+    // Wait briefly for Chrome to potentially appear
+    await this.browser.pause(1500);
     
     const contextsNow = await this.browser.getContexts() as string[];
-    const newContexts = contextsNow.filter(c => 
-      !this.contextsBeforeLogin.includes(String(c))
-    );
+    console.log(`[OAuthFlowManager] Android: Current contexts: ${JSON.stringify(contextsNow)}`);
     
-    console.log(`[OAuthFlowManager] Android: New contexts: ${JSON.stringify(newContexts)}`);
-    
-    const chromeContext = newContexts.find(c => 
-      String(c).toUpperCase().includes("CHROME") || 
-      (String(c).includes("WEBVIEW") && !String(c).includes(String(this.appContext)))
+    // Check if Chrome is now present
+    const chromeContext = contextsNow.find(c => 
+      String(c).toUpperCase().includes("CHROME")
     );
     
     if (chromeContext) {
-      console.log(`[OAuthFlowManager] Android: Chrome webview found - OAuth auto-triggered!`);
+      console.log(`[OAuthFlowManager] Android: Chrome found - OAuth auto-triggered!`);
+      this.oauthAutoTriggered = true;
       return true;
     }
     
-    console.log(`[OAuthFlowManager] Android: No Chrome webview - manual login mode`);
+    console.log(`[OAuthFlowManager] Android: No Chrome - manual login required`);
     return false;
   }
   
@@ -613,16 +708,69 @@ export class OAuthFlowManager {
   
   /**
    * Trigger manual OAuth login by clicking the login button
+   * 
+   * CRITICAL: We must switch to the ORIGINAL app webview (captured before any OAuth),
+   * not any new webviews that may have appeared (those could be Safari/Chrome).
    */
   private async triggerManualLogin(launchpadName: string): Promise<void> {
-    // Switch to app webview if needed
-    const contexts = await this.browser.getContexts() as string[];
-    const appWebview = contexts.find(c => String(c).includes("WEBVIEW"));
+    console.log(`[OAuthFlowManager] Triggering manual login for: ${launchpadName}`);
+    console.log(`[OAuthFlowManager] Original app context: ${this.appContext}`);
+    console.log(`[OAuthFlowManager] Original contexts: ${JSON.stringify(this.contextsBeforeLogin)}`);
     
-    if (appWebview) {
-      await this.browser.switchContext(appWebview as string);
-      console.log(`[OAuthFlowManager] Switched to app webview: ${appWebview}`);
-      await this.browser.pause(1000);
+    // We MUST use the original app context - don't fetch new contexts!
+    // New contexts may include Safari/Chrome which would break wdi5 injection.
+    
+    let targetContext: string | null = null;
+    
+    // Priority 1: Use saved appContext if it's a webview
+    if (this.appContext && String(this.appContext).includes("WEBVIEW")) {
+      targetContext = String(this.appContext);
+      console.log(`[OAuthFlowManager] Using saved app webview: ${targetContext}`);
+    }
+    
+    // Priority 2: Find Android app webview from original contexts
+    if (!targetContext) {
+      targetContext = this.contextsBeforeLogin.find(c => {
+        const ctxStr = String(c).toLowerCase();
+        return ctxStr.includes("webview") && ctxStr.includes("com.neptune");
+      }) || null;
+      if (targetContext) {
+        console.log(`[OAuthFlowManager] Using Android app webview from initial: ${targetContext}`);
+      }
+    }
+    
+    // Priority 3: Any non-browser webview from original contexts
+    if (!targetContext) {
+      targetContext = this.contextsBeforeLogin.find(c => {
+        const ctxStr = String(c).toLowerCase();
+        if (!ctxStr.includes("webview")) return false;
+        if (ctxStr.includes("chrome")) return false;
+        if (ctxStr.includes("terrace")) return false;
+        return true;
+      }) || null;
+      if (targetContext) {
+        console.log(`[OAuthFlowManager] Using webview from initial contexts: ${targetContext}`);
+      }
+    }
+    
+    if (!targetContext) {
+      throw new Error(`[OAuthFlowManager] Cannot find app webview! Original contexts: ${JSON.stringify(this.contextsBeforeLogin)}`);
+    }
+    
+    // Switch to the app webview
+    await this.browser.switchContext(targetContext);
+    console.log(`[OAuthFlowManager] Switched to: ${targetContext}`);
+    await this.browser.pause(1000);
+    
+    // Verify we're in the app (not OAuth page)
+    try {
+      const url = await this.browser.getUrl();
+      console.log(`[OAuthFlowManager] URL after switch: ${url}`);
+      if (!url.startsWith("file://")) {
+        console.log(`[OAuthFlowManager] WARNING: URL doesn't look like app (expected file://)`);
+      }
+    } catch (e) {
+      console.log(`[OAuthFlowManager] Could not verify URL: ${e}`);
     }
     
     // Inject wdi5 (it was skipped at startup for OAuth flows)
@@ -633,7 +781,7 @@ export class OAuthFlowManager {
     // Click the login button
     const launchpad = await ToolboxFactory.createLaunchpad({ launchpadName });
     await launchpad.clickLogin();
-    console.log(`[OAuthFlowManager] Login button clicked`);
+    console.log(`[OAuthFlowManager] Login button clicked - OAuth should open now`);
   }
   
   /**
@@ -686,47 +834,96 @@ export class OAuthFlowManager {
   
   /**
    * Find iOS native browser (Safari) context
+   * 
+   * iOS with ASWebAuthenticationSession:
+   * - Opens Safari as a modal sheet (not a new app)
+   * - Shows "Cancel" button in native layer
+   * - WebView context MAY be accessible (numbered like WEBVIEW_1234.1)
+   * - We need to find any NEW webview context that appeared after our initial capture
    */
   private async findIOSNativeBrowserContext(
     currentContexts: string[],
     getWebviewId: (ctx: string) => number
   ): Promise<Context | null> {
+    // Check if Safari is open via native element detection
     try {
       await this.browser.switchContext("NATIVE_APP");
+      const cancelButton = await this.browser.$('//XCUIElementTypeButton[@name="Cancel"]');
+      const isSafariOpen = await cancelButton.isExisting().catch(() => false);
       
-      // Look for Safari sheet elements
-      const safariSelectors = [
-        '//XCUIElementTypeButton[@name="Cancel"]',
-        '//XCUIElementTypeWebView',
-      ];
-      
-      for (const selector of safariSelectors) {
-        try {
-          const elem = await this.browser.$(selector);
-          if (await elem.isExisting()) {
-            console.log(`[OAuthFlowManager] iOS: Safari detected via ${selector}`);
-            
-            // Get webview contexts, sorted by newness and ID
-            const webviewContexts = currentContexts.filter(
-              ctx => String(ctx).includes("WEBVIEW") && ctx !== this.appContext
-            );
-            
-            const sortedContexts = this.sortContextsByPriority(webviewContexts, getWebviewId);
-            
-            for (const ctx of sortedContexts) {
-              const result = await this.checkContextForOAuth(ctx);
-              if (result) return result;
-            }
-            break;
-          }
-        } catch {
-          // Element not found, continue
-        }
+      if (!isSafariOpen) {
+        console.log(`[OAuthFlowManager] iOS: Safari not detected (no Cancel button)`);
+        return null;
       }
-    } catch {
-      // Native element search failed
+      
+      console.log(`[OAuthFlowManager] iOS: Safari is open (Cancel button visible)`);
+    } catch (e) {
+      console.log(`[OAuthFlowManager] iOS: Native check error: ${e}`);
     }
     
+    // Safari is open - find the OAuth webview
+    // NEW webviews (not in contextsBeforeLogin) are most likely Safari
+    const newWebviews = currentContexts.filter(ctx => {
+      const ctxStr = String(ctx);
+      if (!ctxStr.includes("WEBVIEW")) return false;
+      // Must be NEW (not present before OAuth)
+      return !this.contextsBeforeLogin.some(initial => String(initial) === ctxStr);
+    });
+    
+    console.log(`[OAuthFlowManager] iOS: New webviews since start: ${JSON.stringify(newWebviews)}`);
+    
+    // Sort by priority (highest ID first - newest webview)
+    const sortedNewWebviews = [...newWebviews].sort((a, b) => 
+      getWebviewId(String(b)) - getWebviewId(String(a))
+    );
+    
+    // Try each new webview
+    for (const ctx of sortedNewWebviews) {
+      console.log(`[OAuthFlowManager] iOS: Trying new webview: ${ctx}`);
+      const result = await this.checkContextForOAuth(String(ctx));
+      if (result) {
+        console.log(`[OAuthFlowManager] iOS: Found Safari OAuth context: ${ctx}`);
+        return result;
+      }
+    }
+    
+    // Also check any webview that's NOT our app (fallback)
+    const otherWebviews = currentContexts.filter(ctx => {
+      const ctxStr = String(ctx);
+      if (!ctxStr.includes("WEBVIEW")) return false;
+      if (ctxStr === String(this.appContext)) return false;
+      // Skip ones we already tried
+      if (newWebviews.includes(ctxStr)) return false;
+      return true;
+    });
+    
+    for (const ctx of otherWebviews) {
+      console.log(`[OAuthFlowManager] iOS: Trying other webview: ${ctx}`);
+      const result = await this.checkContextForOAuth(String(ctx));
+      if (result) return result;
+    }
+    
+    // Safari is open but no accessible OAuth webview found
+    // This can happen with ASWebAuthenticationSession - Safari is visible but not switchable
+    console.log(`[OAuthFlowManager] iOS: Safari open but no accessible OAuth webview`);
+    console.log(`[OAuthFlowManager] iOS: Checking if OAuth auto-completed...`);
+    
+    await this.browser.pause(3000);
+    
+    try {
+      await this.browser.switchContext("NATIVE_APP");
+      const cancelButton = await this.browser.$('//XCUIElementTypeButton[@name="Cancel"]');
+      const stillOpen = await cancelButton.isExisting().catch(() => false);
+      
+      if (!stillOpen) {
+        console.log(`[OAuthFlowManager] iOS: Safari closed - OAuth auto-completed!`);
+        return "OAUTH_AUTO_COMPLETED" as unknown as Context;
+      }
+    } catch {
+      // Ignore
+    }
+    
+    console.log(`[OAuthFlowManager] iOS: Waiting for Safari OAuth to become accessible...`);
     return null;
   }
   
@@ -883,53 +1080,196 @@ export class OAuthFlowManager {
   
   /**
    * Return to the app and restore wdi5
+   * 
+   * This is critical for iOS where Safari opens externally. We need to:
+   * 1. Wait for Safari to fully close
+   * 2. Switch to NATIVE_APP first to stabilize
+   * 3. Clear any dialogs
+   * 4. Switch to the app webview
+   * 5. Inject wdi5
    */
   private async returnToAppAndRestore(browserMode: OAuthBrowserMode): Promise<void> {
     console.log(`[OAuthFlowManager] Returning to app (${browserMode} mode)...`);
     
-    const waitTime = this.isIOS() 
-      ? TIMEOUTS.returnToApp.ios 
-      : TIMEOUTS.returnToApp.android;
+    // iOS needs longer wait for Safari to fully close
+    const waitTime = this.isIOS() ? 4000 : TIMEOUTS.returnToApp.android;
+    console.log(`[OAuthFlowManager] Waiting ${waitTime}ms for OAuth browser to close...`);
     await this.browser.pause(waitTime);
     
-    // iOS Native: Switch to first window handle
-    if (browserMode === "native" && this.isIOS()) {
-      try {
-        const windowHandles = await this.browser.getWindowHandles();
-        if (windowHandles.length > 0) {
-          await this.browser.switchToWindow(windowHandles[0]);
-          console.log(`[OAuthFlowManager] iOS: Switched to first window handle`);
+    // CRITICAL: Switch to NATIVE_APP first to stabilize the session
+    // This helps clear any stale webview state from Safari
+    console.log(`[OAuthFlowManager] Switching to NATIVE_APP to stabilize...`);
+    try {
+      await this.browser.switchContext("NATIVE_APP");
+      await this.browser.pause(500);
+    } catch (e) {
+      console.log(`[OAuthFlowManager] NATIVE_APP switch: ${e}`);
+    }
+    
+    // iOS: Clear any blocking dialogs AGGRESSIVELY
+    if (this.isIOS()) {
+      console.log(`[OAuthFlowManager] iOS: Clearing dialogs before webview switch...`);
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          await this.browser.acceptAlert();
+          console.log(`[OAuthFlowManager] iOS: Cleared dialog ${attempt + 1}`);
           await this.browser.pause(500);
+        } catch {
+          // No more dialogs
+          break;
         }
-      } catch (e) {
-        console.log(`[OAuthFlowManager] iOS: Window switch: ${e}`);
+      }
+      // Additional wait for iOS after dialog handling
+      await this.browser.pause(1000);
+    }
+    
+    // Get fresh context list AFTER stabilization
+    const contexts = await this.browser.getContexts() as string[];
+    console.log(`[OAuthFlowManager] Available contexts after stabilization: ${JSON.stringify(contexts)}`);
+    
+    // Find the correct app webview to switch to
+    let targetWebview: string | null = null;
+    
+    // Priority 1: Original app webview from before OAuth
+    if (this.appContext && String(this.appContext).includes("WEBVIEW")) {
+      const stillExists = contexts.some(c => String(c) === String(this.appContext));
+      if (stillExists) {
+        targetWebview = String(this.appContext);
+        console.log(`[OAuthFlowManager] Using original app webview: ${targetWebview}`);
       }
     }
     
-    // Switch to app context
-    if (this.appContext) {
-      try {
-        await this.browser.switchContext(this.appContext as string);
-        console.log(`[OAuthFlowManager] Switched to app context: ${this.appContext}`);
-      } catch {
-        // Fallback: find any webview
-        const contexts = await this.browser.getContexts() as string[];
-        const webview = contexts.find(c => String(c).includes("WEBVIEW"));
-        if (webview) {
-          await this.browser.switchContext(webview);
-          console.log(`[OAuthFlowManager] Fallback: Switched to ${webview}`);
+    // Priority 2: Find app webview from original contexts
+    if (!targetWebview) {
+      for (const ctx of contexts) {
+        const ctxStr = String(ctx);
+        if (!ctxStr.includes("WEBVIEW")) continue;
+        if (ctxStr.toLowerCase().includes("chrome")) continue;
+        
+        // Check if this was in our original contexts
+        const wasOriginal = this.contextsBeforeLogin.some(orig => String(orig) === ctxStr);
+        if (wasOriginal) {
+          targetWebview = ctxStr;
+          console.log(`[OAuthFlowManager] Found original webview: ${targetWebview}`);
+          break;
         }
       }
     }
     
+    // Priority 3: Any non-browser webview
+    if (!targetWebview) {
+      for (const ctx of contexts) {
+        const ctxStr = String(ctx);
+        if (!ctxStr.includes("WEBVIEW")) continue;
+        if (ctxStr.toLowerCase().includes("chrome")) continue;
+        if (ctxStr.toLowerCase().includes("terrace")) continue;
+        targetWebview = ctxStr;
+        console.log(`[OAuthFlowManager] Fallback webview: ${targetWebview}`);
+        break;
+      }
+    }
+    
+    if (!targetWebview) {
+      console.error(`[OAuthFlowManager] ERROR: No app webview found! Contexts: ${JSON.stringify(contexts)}`);
+      throw new Error("No app webview found after OAuth");
+    }
+    
+    // Switch to the app webview
+    console.log(`[OAuthFlowManager] Switching to app webview: ${targetWebview}`);
+    await this.browser.switchContext(targetWebview);
     await this.browser.pause(1000);
+    
+    // Verify URL
+    try {
+      const currentUrl = await this.browser.getUrl();
+      console.log(`[OAuthFlowManager] URL after switch: ${currentUrl}`);
+      if (!currentUrl.startsWith("file://")) {
+        console.log(`[OAuthFlowManager] WARNING: Unexpected URL (expected file://)`);
+      }
+    } catch (e) {
+      console.log(`[OAuthFlowManager] Could not get URL: ${e}`);
+    }
+    
+    // iOS: One more dialog check before wdi5 injection
+    if (this.isIOS()) {
+      try {
+        await this.browser.acceptAlert();
+        console.log(`[OAuthFlowManager] iOS: Cleared late dialog`);
+        await this.browser.pause(500);
+      } catch {
+        // No dialog
+      }
+    }
+    
+    // iOS: "Warm up" the webview connection with simple execute calls
+    // This helps reset any corrupted state from Safari
+    if (this.isIOS()) {
+      console.log(`[OAuthFlowManager] iOS: Warming up webview connection...`);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          // Simple sync execute to test the connection
+          const result = await this.browser.execute(() => {
+            return document.readyState;
+          });
+          console.log(`[OAuthFlowManager] iOS: Webview ready (attempt ${attempt + 1}): ${result}`);
+          break;
+        } catch (e) {
+          console.log(`[OAuthFlowManager] iOS: Warmup attempt ${attempt + 1} failed: ${e}`);
+          await this.browser.pause(1000);
+          
+          // Try clearing any dialogs
+          try { await this.browser.acceptAlert(); } catch { /* ignore */ }
+        }
+      }
+    }
     
     // Re-inject wdi5 - CRITICAL for UI5 interactions after OAuth
     console.log(`[OAuthFlowManager] Re-injecting wdi5...`);
-    await this.browser.injectUI5();
-    await this.browser.pause(TIMEOUTS.postInjection);
+    let wdi5Injected = false;
     
-    console.log(`[OAuthFlowManager] Back in app with wdi5 ready`);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await this.browser.injectUI5();
+        await this.browser.pause(TIMEOUTS.postInjection);
+        console.log(`[OAuthFlowManager] wdi5 injected successfully (attempt ${attempt + 1})`);
+        wdi5Injected = true;
+        break;
+      } catch (e) {
+        console.error(`[OAuthFlowManager] wdi5 injection attempt ${attempt + 1} failed: ${e}`);
+        
+        if (attempt < 2) {
+          // Wait and retry
+          await this.browser.pause(2000);
+          
+          // iOS: Try switching context back and forth to reset state
+          if (this.isIOS()) {
+            try {
+              console.log(`[OAuthFlowManager] iOS: Resetting context...`);
+              await this.browser.switchContext("NATIVE_APP");
+              await this.browser.pause(500);
+              
+              // Clear dialogs
+              try { await this.browser.acceptAlert(); } catch { /* ignore */ }
+              
+              // Switch back to webview
+              if (targetWebview) {
+                await this.browser.switchContext(targetWebview);
+                await this.browser.pause(500);
+              }
+            } catch (ctxErr) {
+              console.log(`[OAuthFlowManager] iOS: Context reset failed: ${ctxErr}`);
+            }
+          }
+        }
+      }
+    }
+    
+    if (!wdi5Injected) {
+      console.error(`[OAuthFlowManager] WARNING: wdi5 injection failed after all attempts!`);
+      console.error(`[OAuthFlowManager] UI5 controls may not work properly.`);
+    }
+    
+    console.log(`[OAuthFlowManager] Back in app`);
   }
   
   /**
