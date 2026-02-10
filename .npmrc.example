@@ -1,0 +1,5 @@
+ignore-scripts=true
+@neptune-software:registry=https://npm.pkg.github.com 
+#Change to your actual top secreat GitHub auth token on next line...
+//npm.pkg.github.com/:_authToken=y0Ur-70p-53cR37-61thub-4U7h-70k3n
+#always-auth=true
