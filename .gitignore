@@ -14,3 +14,5 @@ node_modules/
 
 # compiled target
 dist/
+
+.npmrc
