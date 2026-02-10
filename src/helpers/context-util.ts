@@ -1,10 +1,10 @@
 /**
  * Context Utilities
- * 
+ *
  * Handles all the complexity of context/window switching for BOTH:
  * - Mobile apps: webview/native context switching
  * - Browser apps: tab/window switching for OAuth flows
- * 
+ *
  * Features:
  * - Automatic context detection and classification
  * - Seamless switching between native and webview contexts (mobile)
@@ -12,10 +12,14 @@
  * - OAuth window detection and handling (both mobile and browser)
  * - iOS permission dialogs
  * - Resilient operations that "just work"
- * 
+ *
  * The goal is to abstract away all platform-specific complexity so tests
  * can focus on business logic, not context/window juggling.
  */
+
+/// <reference types="webdriverio" />
+/// <reference types="@wdio/globals/types" />
+/// <reference types="wdio-ui5-service" />
 
 import { Environment } from "../core/environment.js";
 import { ToolboxError } from "../core/errors.js";
@@ -26,10 +30,10 @@ import { WindowHandleUtil } from "./window-handle-util.js";
 /**
  * Types of contexts we can be in.
  */
-export type ContextType = 
-  | "native"       // Native app context (NATIVE_APP)
-  | "webview"      // Main app webview (WEBVIEW_*)
-  | "oauth"        // OAuth browser window
+export type ContextType =
+  | "native" // Native app context (NATIVE_APP)
+  | "webview" // Main app webview (WEBVIEW_*)
+  | "oauth" // OAuth browser window
   | "unknown";
 
 /**
@@ -38,19 +42,19 @@ export type ContextType =
 export interface ContextInfo {
   /** Raw context name from driver */
   name: string;
-  
+
   /** Classified type */
   type: ContextType;
-  
+
   /** Platform */
   platform: "ios" | "android" | "unknown";
-  
+
   /** Whether this is the main app webview */
   isMainApp: boolean;
-  
+
   /** Detected OAuth provider if in OAuth context */
   oauthProvider?: OAuthProvider;
-  
+
   /** App package/bundle this webview belongs to */
   appId?: string;
 }
@@ -61,13 +65,13 @@ export interface ContextInfo {
 export interface ContextSwitchOptions {
   /** Timeout for waiting operations (ms) */
   timeout?: number;
-  
+
   /** Interval between checks (ms) */
   interval?: number;
-  
+
   /** Whether to inject wdi5/UI5 bridge after switching */
   injectUI5?: boolean;
-  
+
   /** Force reinject UI5/wdi5 bridge even if it appears to exist (useful after app restart) */
   forceInject?: boolean;
 }
@@ -78,10 +82,10 @@ export interface ContextSwitchOptions {
 export interface OAuthWindowOptions extends ContextSwitchOptions {
   /** The OAuth provider to look for */
   provider?: OAuthProvider;
-  
+
   /** Whether to handle iOS permission dialog */
   handlePermissionDialog?: boolean;
-  
+
   /** Callback to trigger login button if needed */
   triggerLogin?: () => Promise<void>;
 }
@@ -93,7 +97,10 @@ export class ContextError extends ToolboxError {
   public readonly operation: string;
 
   constructor(operation: string, message: string) {
-    super(`Context operation "${operation}" failed: ${message}`, "CONTEXT_ERROR");
+    super(
+      `Context operation "${operation}" failed: ${message}`,
+      "CONTEXT_ERROR",
+    );
     this.name = "ContextError";
     this.operation = operation;
   }
@@ -101,34 +108,34 @@ export class ContextError extends ToolboxError {
 
 /**
  * Singleton utility for managing contexts (mobile webviews and browser tabs).
- * 
+ *
  * Works for both mobile and browser scenarios:
  * - Mobile: Switches between NATIVE_APP and WEBVIEW_* contexts
  * - Browser: Switches between browser tabs/windows for OAuth flows
- * 
+ *
  * @example
  * ```typescript
  * const ctx = ContextUtil.getInstance();
- * 
+ *
  * // Ensure we're in the main webview
  * await ctx.ensureInWebview();
- * 
+ *
  * // Handle OAuth flow
- * await ctx.waitForOAuthWindow({ 
+ * await ctx.waitForOAuthWindow({
  *   provider: 'azure',
  *   triggerLogin: async () => await Launchpad.clickLogin()
  * });
- * 
+ *
  * // Return to main app after OAuth
  * await ctx.returnToMainApp();
  * ```
  */
 export class ContextUtil {
   private static instance: ContextUtil;
-  
+
   /** Cached main app context name */
   private mainAppContext?: string;
-  
+
   /** Cached main app package/bundle ID */
   private mainAppId?: string;
 
@@ -196,7 +203,7 @@ export class ContextUtil {
    * Get the current context name.
    */
   public async getCurrentContextName(): Promise<string> {
-    return await this.browser.getContext() as string;
+    return (await this.browser.getContext()) as string;
   }
 
   /**
@@ -212,7 +219,7 @@ export class ContextUtil {
    */
   public classifyContext(contextName: string): ContextInfo {
     const platform = this.getPlatform();
-    
+
     // Native context
     if (contextName === "NATIVE_APP") {
       return {
@@ -269,7 +276,7 @@ export class ContextUtil {
    */
   public async getAllContexts(): Promise<ContextInfo[]> {
     const names = await this.getAllContextNames();
-    return names.map(name => this.classifyContext(name));
+    return names.map((name) => this.classifyContext(name));
   }
 
   /**
@@ -287,16 +294,13 @@ export class ContextUtil {
     }
 
     // Heuristics for Neptune apps (Android uses package names like com.neptune.xxx)
-    const neptunePatterns = [
-      /com\.neptune\./i,
-      /neptune/i,
-    ];
+    const neptunePatterns = [/com\.neptune\./i, /neptune/i];
 
     if (appId) {
-      if (neptunePatterns.some(p => p.test(appId))) {
+      if (neptunePatterns.some((p) => p.test(appId))) {
         return true;
       }
-      
+
       // iOS uses numeric webview IDs like "3113.2" - these are valid main app candidates
       // We can't distinguish them by name alone, so we'll let the fallback logic handle it
       // For now, return false and rely on the single-webview fallback or explicit selection
@@ -304,7 +308,7 @@ export class ContextUtil {
 
     return false;
   }
-  
+
   /**
    * Check if an appId looks like an iOS numeric webview ID.
    */
@@ -324,10 +328,7 @@ export class ContextUtil {
         /login\.microsoft\.com/i,
         /microsoftonline/i,
       ],
-      okta: [
-        /\.okta\.com/i,
-        /oktapreview\.com/i,
-      ],
+      okta: [/\.okta\.com/i, /oktapreview\.com/i],
       "btp-ias": [
         /accounts\.sap\.com/i,
         /\.authentication\./i,
@@ -336,7 +337,7 @@ export class ContextUtil {
     };
 
     for (const [provider, regexes] of Object.entries(patterns)) {
-      if (regexes.some(r => r.test(contextOrUrl))) {
+      if (regexes.some((r) => r.test(contextOrUrl))) {
         return provider as OAuthProvider;
       }
     }
@@ -355,7 +356,7 @@ export class ContextUtil {
     } catch (error) {
       throw new ContextError(
         "switchToContext",
-        `Could not switch to context "${contextName}": ${error}`
+        `Could not switch to context "${contextName}": ${error}`,
       );
     }
   }
@@ -370,7 +371,9 @@ export class ContextUtil {
   /**
    * Find and switch to the main app webview.
    */
-  public async switchToMainWebview(options: ContextSwitchOptions = {}): Promise<void> {
+  public async switchToMainWebview(
+    options: ContextSwitchOptions = {},
+  ): Promise<void> {
     const { timeout = DEFAULT_TIMEOUTS.medium, interval = 500 } = options;
 
     // If we have a cached main context, try it first
@@ -388,8 +391,10 @@ export class ContextUtil {
     await this.browser.waitUntil(
       async () => {
         const contexts = await this.getAllContexts();
-        const mainWebview = contexts.find(c => c.type === "webview" && c.isMainApp);
-        
+        const mainWebview = contexts.find(
+          (c) => c.type === "webview" && c.isMainApp,
+        );
+
         if (mainWebview) {
           this.mainAppContext = mainWebview.name;
           this.mainAppId = mainWebview.appId;
@@ -397,44 +402,49 @@ export class ContextUtil {
         }
 
         // Get all webviews
-        const webviews = contexts.filter(c => c.type === "webview");
-        
+        const webviews = contexts.filter((c) => c.type === "webview");
+
         // Fallback 1: if only one webview exists, assume it's the main app
         if (webviews.length === 1) {
           this.mainAppContext = webviews[0].name;
           this.mainAppId = webviews[0].appId;
           return true;
         }
-        
+
         // Fallback 2: iOS uses numeric webview IDs (e.g., WEBVIEW_3113.2)
         // When there are multiple numeric webviews, pick the first non-Chrome one
         if (webviews.length > 0) {
           // Filter out Chrome/browser webviews
-          const appWebviews = webviews.filter(w => 
-            w.appId && 
-            !w.appId.toLowerCase().includes("chrome") &&
-            !w.appId.toLowerCase().includes("browser")
+          const appWebviews = webviews.filter(
+            (w) =>
+              w.appId &&
+              !w.appId.toLowerCase().includes("chrome") &&
+              !w.appId.toLowerCase().includes("browser"),
           );
-          
+
           // If all remaining webviews have numeric IDs (iOS), pick the first one
           // iOS webview IDs are like "3113.2", "3113.4"
-          const iosWebviews = appWebviews.filter(w => 
-            w.appId && this.isIOSNumericWebviewId(w.appId)
+          const iosWebviews = appWebviews.filter(
+            (w) => w.appId && this.isIOSNumericWebviewId(w.appId),
           );
-          
+
           if (iosWebviews.length > 0) {
             // On iOS, the first numeric webview is typically the main app
             this.mainAppContext = iosWebviews[0].name;
             this.mainAppId = iosWebviews[0].appId;
-            console.log(`[ContextUtil] iOS: Selected webview ${this.mainAppContext} as main app`);
+            console.log(
+              `[ContextUtil] iOS: Selected webview ${this.mainAppContext} as main app`,
+            );
             return true;
           }
-          
+
           // If we have webviews but none match our patterns, just take the first one
           if (appWebviews.length > 0) {
             this.mainAppContext = appWebviews[0].name;
             this.mainAppId = appWebviews[0].appId;
-            console.log(`[ContextUtil] Fallback: Selected webview ${this.mainAppContext} as main app`);
+            console.log(
+              `[ContextUtil] Fallback: Selected webview ${this.mainAppContext} as main app`,
+            );
             return true;
           }
         }
@@ -445,7 +455,7 @@ export class ContextUtil {
         timeout,
         interval,
         timeoutMsg: "Could not find main app webview",
-      }
+      },
     );
 
     await this.switchToContext(this.mainAppContext!);
@@ -454,11 +464,26 @@ export class ContextUtil {
   /**
    * Ensure we're in the main app webview.
    * Switches if necessary.
+   *
+   * On iOS, if there are extra webviews (e.g., InAppBrowser for cookie sync),
+   * this method will wait for them to close before switching.
    */
-  public async ensureInWebview(options: ContextSwitchOptions = {}): Promise<void> {
+  public async ensureInWebview(
+    options: ContextSwitchOptions = {},
+  ): Promise<void> {
+    // iOS: Wait for any InAppBrowser cookie sync to complete
+    // This happens after PIN entry when the framework syncs cookies
+    if (this.isIOS()) {
+      await this.waitForInAppBrowserToClose();
+    }
+
     const current = await this.getCurrentContext();
-    
-    if (current.type === "webview" && current.isMainApp && !options.forceInject) {
+
+    if (
+      current.type === "webview" &&
+      current.isMainApp &&
+      !options.forceInject
+    ) {
       // Already in main webview and not forcing reinjection
       if (options.injectUI5) {
         await this.injectUI5(false);
@@ -477,11 +502,168 @@ export class ContextUtil {
   }
 
   /**
+   * Wait for any InAppBrowser (extra webview) to close.
+   *
+   * This handles scenarios where the framework opens InAppBrowser:
+   * - iOS cookie sync after PIN entry
+   * - Background auth refresh
+   * - Token validation
+   *
+   * The InAppBrowser should close automatically once the operation completes.
+   * If it appears stuck (blank screen), this method will attempt to recover.
+   *
+   * @param timeout - Maximum time to wait in ms (default 30s)
+   * @param expectedWebviewCount - Expected number of webviews after close (default 2)
+   */
+  public async waitForInAppBrowserToClose(
+    timeout: number = 30000,
+    expectedWebviewCount: number = 2,
+  ): Promise<void> {
+    const startTime = Date.now();
+    const pollInterval = 1000;
+    const stuckThreshold = 10000; // Consider stuck if no change for 10s
+    let lastChangeTime = Date.now();
+    let lastWebviewCount = 0;
+    let stuckWebviewUrl: string | null = null;
+
+    // First check if there are extra webviews that might be InAppBrowser
+    let contexts = await this.getAllContextNames();
+    let webviewContexts = contexts.filter(
+      (c) => c.includes("WEBVIEW") && !c.toLowerCase().includes("chrome"),
+    );
+
+    // If we have 3+ webviews on iOS, one might be InAppBrowser for cookie sync
+    // Normal state: NATIVE_APP + 1-2 app webviews
+    // Cookie sync state: NATIVE_APP + 2-3 webviews (extra one is InAppBrowser)
+    const initialWebviewCount = webviewContexts.length;
+    lastWebviewCount = initialWebviewCount;
+
+    if (initialWebviewCount <= 2) {
+      // Normal state, no extra webviews
+      console.log(
+        `[ContextUtil] iOS: No extra webviews detected (${initialWebviewCount}), cookie sync not needed`,
+      );
+      return;
+    }
+
+    console.log(
+      `[ContextUtil] iOS: Detected ${initialWebviewCount} webviews, waiting for InAppBrowser cookie sync...`,
+    );
+
+    // Capture the original/main app webview to return to later
+    const mainAppWebview = this.mainAppContext || webviewContexts[0];
+
+    // Wait for webview count to decrease (InAppBrowser closing)
+    while (Date.now() - startTime < timeout) {
+      await this.browser.pause(pollInterval);
+
+      contexts = await this.getAllContextNames();
+      webviewContexts = contexts.filter(
+        (c) => c.includes("WEBVIEW") && !c.toLowerCase().includes("chrome"),
+      );
+
+      if (webviewContexts.length !== lastWebviewCount) {
+        lastChangeTime = Date.now();
+        lastWebviewCount = webviewContexts.length;
+      }
+
+      if (webviewContexts.length < initialWebviewCount) {
+        console.log(
+          `[ContextUtil] iOS: InAppBrowser closed (webviews: ${initialWebviewCount} -> ${webviewContexts.length})`,
+        );
+        await this.browser.pause(500);
+        return;
+      }
+
+      // Check if stuck (no change for too long)
+      const stuckDuration = Date.now() - lastChangeTime;
+      if (stuckDuration > stuckThreshold) {
+        console.log(
+          `[ContextUtil] iOS: InAppBrowser appears stuck (no change for ${Math.round(stuckDuration / 1000)}s)`,
+        );
+
+        // Try to diagnose the stuck state
+        const extraWebviews = webviewContexts.filter(
+          (w) => w !== mainAppWebview,
+        );
+
+        for (const ctx of extraWebviews) {
+          try {
+            await this.browser.switchContext(ctx);
+            const url = await this.browser.getUrl();
+            console.log(`[ContextUtil] iOS: Stuck webview ${ctx} URL: ${url}`);
+            stuckWebviewUrl = url;
+
+            // If it's a blank or about:blank page, the cookie sync likely failed
+            if (url === "about:blank" || url === "" || !url) {
+              console.log(
+                `[ContextUtil] iOS: InAppBrowser shows blank - cookie sync may have failed`,
+              );
+
+              // Try to close the InAppBrowser by navigating back to main webview
+              // The framework should eventually close it
+            }
+          } catch (e) {
+            console.log(
+              `[ContextUtil] iOS: Cannot access stuck webview ${ctx}: ${e}`,
+            );
+          }
+        }
+
+        // After diagnosing, switch back to main app webview
+        try {
+          await this.browser.switchContext(mainAppWebview);
+        } catch (e) {
+          console.log(
+            `[ContextUtil] iOS: Failed to switch back to main webview: ${e}`,
+          );
+        }
+
+        // If stuck for too long, break out and let the test continue
+        // The framework may eventually close the InAppBrowser
+        if (stuckDuration > 20000) {
+          console.log(
+            `[ContextUtil] iOS: InAppBrowser stuck for too long, proceeding anyway`,
+          );
+          console.log(
+            `[ContextUtil] iOS: Last known stuck URL: ${stuckWebviewUrl}`,
+          );
+          return;
+        }
+      }
+
+      const elapsed = Math.round((Date.now() - startTime) / 1000);
+      if (elapsed % 5 === 0) {
+        console.log(
+          `[ContextUtil] iOS: Waiting for InAppBrowser to close... (${elapsed}s, webviews: ${webviewContexts.length})`,
+        );
+      }
+    }
+
+    console.log(
+      `[ContextUtil] iOS: Timeout waiting for InAppBrowser to close after ${Math.round(timeout / 1000)}s`,
+    );
+    console.log(
+      `[ContextUtil] iOS: Current webview count: ${webviewContexts.length}, expected: ${expectedWebviewCount}`,
+    );
+
+    // Switch back to main app webview before returning
+    try {
+      await this.browser.switchContext(mainAppWebview);
+      console.log(
+        `[ContextUtil] iOS: Switched back to main app webview: ${mainAppWebview}`,
+      );
+    } catch (e) {
+      console.log(`[ContextUtil] iOS: Failed to switch to main webview: ${e}`);
+    }
+  }
+
+  /**
    * Ensure we're in native context.
    */
   public async ensureInNative(): Promise<void> {
     const current = await this.getCurrentContext();
-    
+
     if (current.type === "native") {
       return; // Already in native
     }
@@ -493,14 +675,16 @@ export class ContextUtil {
 
   /**
    * Wait for an OAuth window to appear and switch to it.
-   * 
+   *
    * This handles the complexity of:
    * - Checking if already in OAuth window
    * - Triggering login button if needed
    * - Waiting for new window/context
    * - iOS permission dialogs
    */
-  public async waitForOAuthWindow(options: OAuthWindowOptions = {}): Promise<void> {
+  public async waitForOAuthWindow(
+    options: OAuthWindowOptions = {},
+  ): Promise<void> {
     const {
       timeout = DEFAULT_TIMEOUTS.long,
       interval = 1000,
@@ -521,7 +705,7 @@ export class ContextUtil {
     const initialContexts = await this.getAllContextNames();
     const windowHandleUtil = WindowHandleUtil.getInstance();
     let initialHandles: string[] = [];
-    
+
     try {
       initialHandles = await windowHandleUtil.getWindowHandles();
     } catch {
@@ -548,8 +732,10 @@ export class ContextUtil {
       async () => {
         // Check for new contexts
         const currentContexts = await this.getAllContextNames();
-        const newContexts = currentContexts.filter(c => !initialContexts.includes(c));
-        
+        const newContexts = currentContexts.filter(
+          (c) => !initialContexts.includes(c),
+        );
+
         for (const ctx of newContexts) {
           const info = this.classifyContext(ctx);
           if (info.type === "oauth" || info.type === "webview") {
@@ -563,15 +749,17 @@ export class ContextUtil {
         // Check for new window handles (browser-based OAuth)
         try {
           const currentHandles = await windowHandleUtil.getWindowHandles();
-          const newHandles = currentHandles.filter(h => !initialHandles.includes(h));
-          
+          const newHandles = currentHandles.filter(
+            (h) => !initialHandles.includes(h),
+          );
+
           if (newHandles.length > 0) {
             await windowHandleUtil.switchToWindow(newHandles[0]);
-            
+
             // Verify it's an OAuth window by checking URL
             const url = await this.browser.getUrl();
             const detectedProvider = this.detectOAuthProvider(url);
-            
+
             if (!provider || detectedProvider === provider) {
               return true;
             }
@@ -586,7 +774,7 @@ export class ContextUtil {
         timeout,
         interval,
         timeoutMsg: `OAuth window${provider ? ` for ${provider}` : ""} did not appear`,
-      }
+      },
     );
   }
 
@@ -604,9 +792,9 @@ export class ContextUtil {
 
       // Look for common iOS permission dialog buttons
       const continueSelectors = [
-        '~Continue',
-        '~Allow',
-        '~OK',
+        "~Continue",
+        "~Allow",
+        "~OK",
         '**/XCUIElementTypeButton[`label == "Continue"`]',
         '**/XCUIElementTypeButton[`label == "Allow"`]',
       ];
@@ -633,7 +821,9 @@ export class ContextUtil {
    * Return to the main app after OAuth flow.
    * Handles closing OAuth windows and switching contexts.
    */
-  public async returnToMainApp(options: ContextSwitchOptions = {}): Promise<void> {
+  public async returnToMainApp(
+    options: ContextSwitchOptions = {},
+  ): Promise<void> {
     const { injectUI5 = true } = options;
 
     try {
@@ -676,8 +866,10 @@ export class ContextUtil {
         }
       }
 
+      //@ts-ignore
       if (typeof this.browser.injectUI5 === "function") {
         console.log("[ContextUtil] Injecting UI5/wdi5 bridge");
+        //@ts-ignore
         await this.browser.injectUI5();
       }
     } catch (error) {
@@ -688,11 +880,14 @@ export class ContextUtil {
   /**
    * Wait for UI5 to be ready in current context.
    */
-  public async waitForUI5Ready(timeout: number = DEFAULT_TIMEOUTS.medium): Promise<void> {
+  public async waitForUI5Ready(
+    timeout: number = DEFAULT_TIMEOUTS.medium,
+  ): Promise<void> {
     await this.browser.waitUntil(
       async () => {
         try {
           const ready = await this.browser.execute(() => {
+            //@ts-ignore
             const core = window.sap?.ui?.getCore?.();
             return core ? core.isInitialized() : false;
           });
@@ -705,7 +900,7 @@ export class ContextUtil {
         timeout,
         interval: 500,
         timeoutMsg: "UI5 did not become ready",
-      }
+      },
     );
   }
 
@@ -715,7 +910,10 @@ export class ContextUtil {
    * Execute a function in the main webview context.
    * Switches contexts if needed and returns afterward.
    */
-  public async executeInWebview<T>(fn: () => Promise<T>, options: ContextSwitchOptions = {}): Promise<T> {
+  public async executeInWebview<T>(
+    fn: () => Promise<T>,
+    options: ContextSwitchOptions = {},
+  ): Promise<T> {
     const originalContext = await this.getCurrentContextName();
     const current = await this.getCurrentContext();
 
@@ -772,7 +970,7 @@ export class ContextUtil {
     const currentName = await this.getCurrentContextName();
     const allNames = await this.getAllContextNames();
     const allContexts = await this.getAllContexts();
-    
+
     let windowHandles: string[] = [];
     try {
       windowHandles = await WindowHandleUtil.getInstance().getWindowHandles();

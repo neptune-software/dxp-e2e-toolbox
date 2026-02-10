@@ -28,6 +28,7 @@ declare global {
   /** Augmentation for browser execute() context (Neptune, wdi5, UI5). */
   interface Window {
     neptune?: { Splash?: { isActive(): boolean } };
+    //@ts-ignore
     wdi5?: unknown;
     sap?: {
       ui?: {
