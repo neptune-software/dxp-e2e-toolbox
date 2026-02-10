@@ -174,34 +174,16 @@ classDiagram
 The toolbox uses a version resolver to pick the correct implementation based on DXP version:
 
 ```mermaid
-flowchart LR
-    subgraph Input
-        V[Version: "24.14.1"]
-        E[Edition: "sap-edition"]
-    end
-    
-    subgraph VersionResolver
-        R1{Match 24?}
-        R2{Match 23?}
-        R3{Match 22.10?}
-        R4{Match 22?}
-        RB[Use Base]
-    end
-    
-    subgraph Implementations
-        I23[LaunchpadV23]
-        I22_10[LaunchpadV22_10]
-        I22[LaunchpadV22]
-        IB[BaseLaunchpad]
-    end
-    
-    V --> R1
-    R1 -->|No match| R2
-    R2 -->|Match!| I23
-    R1 -->|No 24 impl| R2
-    R3 --> I22_10
-    R4 --> I22
-    RB --> IB
+flowchart TD
+    V[Version: 24.14.1] --> R1{Has v24 impl?}
+    R1 -->|No| R2{Has v23 impl?}
+    R1 -->|Yes| I24[LaunchpadV24]
+    R2 -->|Yes| I23[LaunchpadV23]
+    R2 -->|No| R3{Has v22.10 impl?}
+    R3 -->|Yes| I22_10[LaunchpadV22_10]
+    R3 -->|No| R4{Has v22 impl?}
+    R4 -->|Yes| I22[LaunchpadV22]
+    R4 -->|No| IB[BaseLaunchpad]
 ```
 
 ## Quick Start
