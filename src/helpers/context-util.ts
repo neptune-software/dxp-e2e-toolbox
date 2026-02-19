@@ -280,41 +280,48 @@ export class ContextUtil {
   }
 
   /**
-   * Check if a context is the main app webview.
+   * Check if a context is the main app webview (synchronous heuristic check).
+   * Used by classifyContext which must be sync.
+   * For definitive detection, use probeForNeptuneApp() which actually
+   * switches into the context and checks for the `neptune` global.
    */
   private isMainAppContext(contextName: string, appId?: string): boolean {
-    // If we have a cached main app context, use that
     if (this.mainAppContext) {
       return contextName === this.mainAppContext;
     }
 
-    // If we have a cached main app ID, check against it
     if (this.mainAppId && appId) {
       return appId === this.mainAppId || appId.includes(this.mainAppId);
     }
 
-    // Heuristics for Neptune apps (Android uses package names like com.neptune.xxx)
-    const neptunePatterns = [/com\.neptune\./i, /neptune/i];
-
-    if (appId) {
-      if (neptunePatterns.some((p) => p.test(appId))) {
-        return true;
-      }
-
-      // iOS uses numeric webview IDs like "3113.2" - these are valid main app candidates
-      // We can't distinguish them by name alone, so we'll let the fallback logic handle it
-      // For now, return false and rely on the single-webview fallback or explicit selection
+    // Android: package names like com.neptune.basicpin
+    if (appId && /neptune/i.test(appId)) {
+      return true;
     }
 
     return false;
   }
 
   /**
-   * Check if an appId looks like an iOS numeric webview ID.
+   * Probe a webview context to check if it contains the Neptune app
+   * by looking for the `neptune` global variable on `window`.
+   * 
+   * This is the definitive way to find the main app webview because
+   * Neptune DXP always exposes `window.neptune`. This works regardless
+   * of platform (Android package name vs iOS numeric webview ID).
+   * 
+   * @returns true if the context contains the Neptune app
    */
-  private isIOSNumericWebviewId(appId: string): boolean {
-    // iOS webview IDs are numeric like "3113.2", "3113.4"
-    return /^\d+(\.\d+)?$/.test(appId);
+  private async probeForNeptuneApp(contextName: string): Promise<boolean> {
+    try {
+      await this.browser.switchContext(contextName);
+      const hasNeptune = await this.browser.execute(() => {
+        return typeof (window as any).neptune !== "undefined";
+      });
+      return hasNeptune === true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -370,86 +377,68 @@ export class ContextUtil {
 
   /**
    * Find and switch to the main app webview.
+   * 
+   * Detection strategy (in order):
+   * 1. Use cached context if available
+   * 2. Heuristic match (Android package name contains "neptune")
+   * 3. Probe each webview for `window.neptune` global (definitive)
+   * 4. Fallback to the first non-browser webview
    */
   public async switchToMainWebview(
     options: ContextSwitchOptions = {},
   ): Promise<void> {
     const { timeout = DEFAULT_TIMEOUTS.medium, interval = 500 } = options;
 
-    // If we have a cached main context, try it first
+    // Fast path: cached context
     if (this.mainAppContext) {
       try {
         await this.switchToContext(this.mainAppContext);
         return;
       } catch {
-        // Cache is stale, clear and retry
         this.mainAppContext = undefined;
       }
     }
 
-    // Wait for main webview to be available
     await this.browser.waitUntil(
       async () => {
-        const contexts = await this.getAllContexts();
-        const mainWebview = contexts.find(
-          (c) => c.type === "webview" && c.isMainApp,
+        const contextNames = await this.getAllContextNames();
+        const webviewNames = contextNames.filter(
+          (c) => c.includes("WEBVIEW") && !c.toLowerCase().includes("chrome"),
         );
 
-        if (mainWebview) {
-          this.mainAppContext = mainWebview.name;
-          this.mainAppId = mainWebview.appId;
+        if (webviewNames.length === 0) return false;
+
+        // Single webview: it's the one
+        if (webviewNames.length === 1) {
+          this.mainAppContext = webviewNames[0];
+          console.log(`[ContextUtil] Single webview found: ${this.mainAppContext}`);
           return true;
         }
 
-        // Get all webviews
-        const webviews = contexts.filter((c) => c.type === "webview");
-
-        // Fallback 1: if only one webview exists, assume it's the main app
-        if (webviews.length === 1) {
-          this.mainAppContext = webviews[0].name;
-          this.mainAppId = webviews[0].appId;
+        // Multiple webviews: try heuristic first (fast, no context switch needed)
+        const heuristicMatch = webviewNames.find((name) => /neptune/i.test(name));
+        if (heuristicMatch) {
+          this.mainAppContext = heuristicMatch;
+          console.log(`[ContextUtil] Heuristic match: ${this.mainAppContext}`);
           return true;
         }
 
-        // Fallback 2: iOS uses numeric webview IDs (e.g., WEBVIEW_3113.2)
-        // When there are multiple numeric webviews, pick the first non-Chrome one
-        if (webviews.length > 0) {
-          // Filter out Chrome/browser webviews
-          const appWebviews = webviews.filter(
-            (w) =>
-              w.appId &&
-              !w.appId.toLowerCase().includes("chrome") &&
-              !w.appId.toLowerCase().includes("browser"),
-          );
-
-          // If all remaining webviews have numeric IDs (iOS), pick the first one
-          // iOS webview IDs are like "3113.2", "3113.4"
-          const iosWebviews = appWebviews.filter(
-            (w) => w.appId && this.isIOSNumericWebviewId(w.appId),
-          );
-
-          if (iosWebviews.length > 0) {
-            // On iOS, the first numeric webview is typically the main app
-            this.mainAppContext = iosWebviews[0].name;
-            this.mainAppId = iosWebviews[0].appId;
-            console.log(
-              `[ContextUtil] iOS: Selected webview ${this.mainAppContext} as main app`,
-            );
-            return true;
-          }
-
-          // If we have webviews but none match our patterns, just take the first one
-          if (appWebviews.length > 0) {
-            this.mainAppContext = appWebviews[0].name;
-            this.mainAppId = appWebviews[0].appId;
-            console.log(
-              `[ContextUtil] Fallback: Selected webview ${this.mainAppContext} as main app`,
-            );
+        // Probe each webview for window.neptune (definitive but slower)
+        console.log(`[ContextUtil] Probing ${webviewNames.length} webviews for Neptune app...`);
+        for (const name of webviewNames) {
+          if (await this.probeForNeptuneApp(name)) {
+            this.mainAppContext = name;
+            const appId = name.match(/WEBVIEW_(.+)/i)?.[1];
+            if (appId) this.mainAppId = appId;
+            console.log(`[ContextUtil] Probe found Neptune app in: ${this.mainAppContext}`);
             return true;
           }
         }
 
-        return false;
+        // Last resort: take the first one
+        this.mainAppContext = webviewNames[0];
+        console.log(`[ContextUtil] Fallback to first webview: ${this.mainAppContext}`);
+        return true;
       },
       {
         timeout,
@@ -464,38 +453,53 @@ export class ContextUtil {
   /**
    * Ensure we're in the main app webview.
    * Switches if necessary.
-   *
-   * On iOS, if there are extra webviews (e.g., InAppBrowser for cookie sync),
-   * this method will wait for them to close before switching.
+   * 
+   * Uses `window.neptune` probe to definitively identify the correct webview
+   * when heuristics alone cannot determine it.
    */
   public async ensureInWebview(
     options: ContextSwitchOptions = {},
   ): Promise<void> {
     // iOS: Wait for any InAppBrowser cookie sync to complete
-    // This happens after PIN entry when the framework syncs cookies
     if (this.isIOS()) {
       await this.waitForInAppBrowserToClose();
     }
 
-    const current = await this.getCurrentContext();
+    const currentName = await this.getCurrentContextName();
 
-    if (
-      current.type === "webview" &&
-      current.isMainApp &&
-      !options.forceInject
-    ) {
-      // Already in main webview and not forcing reinjection
+    // If we already know this is the main app context, skip
+    if (currentName === this.mainAppContext && !options.forceInject) {
       if (options.injectUI5) {
         await this.injectUI5(false);
       }
       return;
     }
 
-    if (current.type !== "webview" || !current.isMainApp) {
-      await this.switchToMainWebview(options);
+    // If we're in a webview but don't know if it's the main app,
+    // probe it instead of blindly switching away
+    if (currentName.includes("WEBVIEW") && !this.mainAppContext) {
+      try {
+        const hasNeptune = await this.browser.execute(() => {
+          return typeof (window as any).neptune !== "undefined";
+        });
+        if (hasNeptune) {
+          this.mainAppContext = currentName;
+          const appId = currentName.match(/WEBVIEW_(.+)/i)?.[1];
+          if (appId) this.mainAppId = appId;
+          console.log(`[ContextUtil] Already in Neptune app webview: ${currentName}`);
+          if (options.injectUI5 || options.forceInject) {
+            await this.injectUI5(options.forceInject ?? false);
+          }
+          return;
+        }
+      } catch {
+        // execute failed, need to switch
+      }
     }
 
-    // Optionally inject UI5 bridge
+    // Not in main webview, find it
+    await this.switchToMainWebview(options);
+
     if (options.injectUI5 || options.forceInject) {
       await this.injectUI5(options.forceInject ?? false);
     }
