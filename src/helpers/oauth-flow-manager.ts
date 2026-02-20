@@ -64,6 +64,7 @@ import { AzureLogin, AzureLoginOptions } from "../oauth/azure-login.js";
 import { OktaLogin, OktaLoginOptions } from "../oauth/okta-login.js";
 import { BtpIasLogin, BtpIasLoginOptions } from "../oauth/btp-ias-login.js";
 import { ToolboxFactory } from "../core/toolbox-factory.js";
+import { ContextUtil } from "./context-util.js";
 
 /**
  * Extended browser interface with wdi5 commands
@@ -545,6 +546,12 @@ export class OAuthFlowManager {
         this.appContext = null;
       }
     }
+
+    // Share the app context with ContextUtil so it never has to probe for it
+    if (this.appContext && String(this.appContext).includes("WEBVIEW")) {
+      const contextUtil = ContextUtil.getInstance();
+      contextUtil.setMainAppContext(String(this.appContext));
+    }
   }
   
   /**
@@ -666,6 +673,57 @@ export class OAuthFlowManager {
     console.log(`[OAuthFlowManager] Finding OAuth context (${browserMode} mode)...`);
     
     const startTime = Date.now();
+    
+    const iosInAppBrowser = this.isIOS() && browserMode === "inappbrowser";
+    
+    // On iOS with InAppBrowser mode, all WKWebViews share one WebKit
+    // WebContent process. Attaching the Safari Remote Inspector to ANY
+    // webview (via switchContext) blocks the shared JS thread AND
+    // persists even after switching back to NATIVE_APP, preventing the
+    // InAppBrowser from navigating to its target URL.
+    //
+    // Fix: use Appium's `mobile: getContexts` to read webview URLs
+    // through the Remote Debugger's listing protocol — this enumerates
+    // targets WITHOUT attaching the inspector. Only switch to the
+    // InAppBrowser AFTER its page has fully loaded.
+    if (iosInAppBrowser) {
+      console.log(`[OAuthFlowManager] iOS InAppBrowser: Staying in NATIVE_APP — using inspector-free URL detection...`);
+      try { await this.browser.switchContext("NATIVE_APP"); } catch { /* already native */ }
+      await this.browser.pause(3000);
+      
+      let phantomRetried = false;
+      
+      while (Date.now() - startTime < timeout) {
+        const elapsedSec = Math.round((Date.now() - startTime) / 1000);
+        
+        const oauthCtxId = await this.findOAuthContextViaListing(elapsedSec);
+        if (oauthCtxId) {
+          console.log(`[OAuthFlowManager] iOS InAppBrowser: OAuth page loaded in ${oauthCtxId}, switching...`);
+          await this.browser.switchContext(oauthCtxId);
+          await this.stabilizeOAuthContext();
+          return oauthCtxId as Context;
+        }
+        
+        // After 10s without an OAuth URL, a phantom InAppBrowser (from prior
+        // app navigation) is likely blocking. Close it via the native "Done"
+        // button, then re-click login to open a fresh InAppBrowser.
+        if (!phantomRetried && elapsedSec >= 10) {
+          const closed = await this.closeInAppBrowserViaDoneButton();
+          if (closed && this.currentOptions?.launchpadName) {
+            console.log(`[OAuthFlowManager] iOS: Re-clicking login after phantom cleanup...`);
+            await this.clickLoginButton(this.currentOptions.launchpadName);
+            try { await this.browser.switchContext("NATIVE_APP"); } catch { /* already native */ }
+            await this.browser.pause(3000);
+            phantomRetried = true;
+            continue;
+          }
+        }
+        
+        await this.browser.pause(TIMEOUTS.pollInterval);
+      }
+      
+      throw new Error(`[OAuthFlowManager] No OAuth context found after ${timeout}ms`);
+    }
     
     // Helper to get numeric webview ID for sorting
     const getWebviewId = (ctx: string): number => {
@@ -791,6 +849,86 @@ export class OAuthFlowManager {
     }
     
     console.log(`[OAuthFlowManager] iOS: Waiting for Safari OAuth to become accessible...`);
+    return null;
+  }
+  
+  /**
+   * Close a phantom InAppBrowser by pressing the native "Done" button.
+   *
+   * After certain app navigations (e.g., addAnotherUser), the Cordova app
+   * may open an InAppBrowser to file:///index.html. This blocks the OAuth
+   * InAppBrowser from opening (Cordova allows only one active window).
+   * Pressing "Done" via native UI closes the phantom without touching the
+   * Safari Remote Inspector.
+   */
+  private async closeInAppBrowserViaDoneButton(): Promise<boolean> {
+    try {
+      try { await this.browser.switchContext("NATIVE_APP"); } catch { /* already native */ }
+      
+      // The Cordova InAppBrowser close button defaults to "Done"
+      let doneButton = await this.browser.$('//XCUIElementTypeButton[@name="Done"]');
+      let exists = await doneButton.isExisting().catch(() => false);
+      
+      if (!exists) {
+        // Try German localization
+        doneButton = await this.browser.$('//XCUIElementTypeButton[@name="Fertig"]');
+        exists = await doneButton.isExisting().catch(() => false);
+      }
+      
+      if (!exists) {
+        console.log(`[OAuthFlowManager] iOS: No InAppBrowser "Done" button found`);
+        return false;
+      }
+      
+      console.log(`[OAuthFlowManager] iOS: Pressing "Done" to close phantom InAppBrowser...`);
+      await doneButton.click();
+      await this.browser.pause(2000);
+      console.log(`[OAuthFlowManager] iOS: Phantom InAppBrowser closed`);
+      return true;
+    } catch (e) {
+      console.log(`[OAuthFlowManager] iOS: Could not close phantom InAppBrowser: ${e}`);
+      return false;
+    }
+  }
+  
+  /**
+   * Find OAuth context via Appium's `mobile: getContexts` (iOS only).
+   *
+   * This uses the Remote Debugger's listing protocol to enumerate webview
+   * targets and read their URLs WITHOUT attaching the Safari inspector.
+   * This is critical on iOS because attaching the inspector to a WKWebView
+   * blocks the shared WebKit process and prevents InAppBrowser navigation.
+   */
+  private async findOAuthContextViaListing(elapsedSec: number): Promise<string | null> {
+    try {
+      const detailed = await this.browser.execute('mobile: getContexts') as any[];
+      if (!Array.isArray(detailed)) {
+        console.log(`[OAuthFlowManager] [${elapsedSec}s] mobile: getContexts returned non-array`);
+        return null;
+      }
+      
+      const webviews = detailed.filter(
+        (c: any) => c && c.id && String(c.id).includes("WEBVIEW") && String(c.id) !== String(this.appContext)
+      );
+      
+      for (const ctx of webviews) {
+        const url = ctx.url || "(no url)";
+        const title = ctx.title || "";
+        console.log(`[OAuthFlowManager] [${elapsedSec}s] ${ctx.id}: ${url} (${title})`);
+        
+        if (ctx.url && await this.isOAuthUrl(ctx.url)) {
+          return String(ctx.id);
+        }
+      }
+      
+      if (webviews.length === 0) {
+        console.log(`[OAuthFlowManager] [${elapsedSec}s] No non-app webviews found`);
+      }
+    } catch (e) {
+      console.log(`[OAuthFlowManager] [${elapsedSec}s] mobile: getContexts failed: ${e}`);
+      console.log(`[OAuthFlowManager] Falling back to standard context check...`);
+      return null;
+    }
     return null;
   }
   
@@ -946,58 +1084,39 @@ export class OAuthFlowManager {
   }
   
   /**
-   * Return to the app and restore wdi5
+   * Return to the app after OAuth completes.
    * 
-   * This is critical for iOS where Safari opens externally. We need to:
-   * 1. Wait for Safari to fully close
-   * 2. Switch to NATIVE_APP first to stabilize
-   * 3. Clear any dialogs
-   * 4. Switch to the app webview
-   * 5. Inject wdi5
+   * IMPORTANT: Keep this minimal! The app needs its own event loop free to
+   * handle post-OAuth lifecycle (cookie sync InAppBrowser, session setup, etc.).
+   * Every execute() call via the Remote Inspector occupies the main webview's
+   * JS event loop and can delay/prevent the app's own handlers from firing.
+   * 
+   * For InAppBrowser mode on iOS, the page was never reloaded — the wdi5 bridge
+   * is still present from initial injection. We just need to switch to the right
+   * context and confirm.
    */
   private async returnToAppAndRestore(browserMode: OAuthBrowserMode): Promise<void> {
     console.log(`[OAuthFlowManager] Returning to app (${browserMode} mode)...`);
     
-    // iOS needs longer wait for Safari to fully close
-    const waitTime = this.isIOS() ? 4000 : TIMEOUTS.returnToApp.android;
+    const waitTime = this.isIOS() ? 3000 : TIMEOUTS.returnToApp.android;
     console.log(`[OAuthFlowManager] Waiting ${waitTime}ms for OAuth browser to close...`);
     await this.browser.pause(waitTime);
     
-    // CRITICAL: Switch to NATIVE_APP first to stabilize the session
-    // This helps clear any stale webview state from Safari
-    console.log(`[OAuthFlowManager] Switching to NATIVE_APP to stabilize...`);
+    // Switch to NATIVE_APP first — this is a clean "reset" point
+    console.log(`[OAuthFlowManager] Switching to NATIVE_APP...`);
     try {
       await this.browser.switchContext("NATIVE_APP");
-      await this.browser.pause(500);
     } catch (e) {
       console.log(`[OAuthFlowManager] NATIVE_APP switch: ${e}`);
     }
     
-    // iOS: Clear any blocking dialogs AGGRESSIVELY
-    if (this.isIOS()) {
-      // console.log(`[OAuthFlowManager] iOS: Clearing dialogs before webview switch...`);
-      // for (let attempt = 0; attempt < 5; attempt++) {
-      //   try {
-      //     await this.browser.acceptAlert();
-      //     console.log(`[OAuthFlowManager] iOS: Cleared dialog ${attempt + 1}`);
-      //     await this.browser.pause(500);
-      //   } catch {
-      //     // No more dialogs
-      //     break;
-      //   }
-      // }
-      // Additional wait for iOS after dialog handling
-      await this.browser.pause(1000);
-    }
-    
-    // Get fresh context list AFTER stabilization
+    // Get fresh context list
     const contexts = await this.browser.getContexts() as string[];
-    console.log(`[OAuthFlowManager] Available contexts after stabilization: ${JSON.stringify(contexts)}`);
+    console.log(`[OAuthFlowManager] Contexts after OAuth: ${JSON.stringify(contexts)}`);
     
-    // Find the correct app webview to switch to
+    // Find the correct app webview
     let targetWebview: string | null = null;
     
-    // Priority 1: Original app webview from before OAuth
     if (this.appContext && String(this.appContext).includes("WEBVIEW")) {
       const stillExists = contexts.some(c => String(c) === String(this.appContext));
       if (stillExists) {
@@ -1006,14 +1125,12 @@ export class OAuthFlowManager {
       }
     }
     
-    // Priority 2: Find app webview from original contexts
     if (!targetWebview) {
       for (const ctx of contexts) {
         const ctxStr = String(ctx);
         if (!ctxStr.includes("WEBVIEW")) continue;
         if (ctxStr.toLowerCase().includes("chrome")) continue;
         
-        // Check if this was in our original contexts
         const wasOriginal = this.contextsBeforeLogin.some(orig => String(orig) === ctxStr);
         if (wasOriginal) {
           targetWebview = ctxStr;
@@ -1023,16 +1140,13 @@ export class OAuthFlowManager {
       }
     }
     
-    // Priority 3: Any non-browser webview
     if (!targetWebview) {
-      for (const ctx of contexts) {
-        const ctxStr = String(ctx);
-        if (!ctxStr.includes("WEBVIEW")) continue;
-        if (ctxStr.toLowerCase().includes("chrome")) continue;
-        if (ctxStr.toLowerCase().includes("terrace")) continue;
-        targetWebview = ctxStr;
-        console.log(`[OAuthFlowManager] Fallback webview: ${targetWebview}`);
-        break;
+      // Fallback: use lowest-numbered webview on iOS (main app)
+      const webviews = contexts.map(String).filter(c => c.includes("WEBVIEW") && !c.toLowerCase().includes("chrome"));
+      if (webviews.length > 0) {
+        webviews.sort();
+        targetWebview = webviews[0];
+        console.log(`[OAuthFlowManager] Fallback to first webview: ${targetWebview}`);
       }
     }
     
@@ -1041,192 +1155,65 @@ export class OAuthFlowManager {
       throw new Error("No app webview found after OAuth");
     }
     
-    // Switch to the app webview
+    // Share the app context with ContextUtil BEFORE switching
+    const contextUtil = ContextUtil.getInstance();
+    contextUtil.setMainAppContext(targetWebview);
+    
+    // On iOS, the app may open a cookie-sync InAppBrowser shortly after OAuth.
+    // All WKWebViews in a Cordova app share one WebKit WebContent process.
+    // Connecting the Safari Remote Inspector to ANY webview (via switchContext)
+    // imposes overhead on the shared JS thread and blocks the InAppBrowser
+    // from loading its page — causing the blank white screen.
+    //
+    // FIX: Stay in NATIVE_APP (no inspector connection) while the cookie-sync
+    // InAppBrowser loads. Only switch to the app webview AFTER cookie sync
+    // has had a clean window to complete. getContexts() is safe because it
+    // uses the XCUITest driver, not the Remote Inspector.
+    if (this.isIOS()) {
+      console.log(`[OAuthFlowManager] iOS: Staying in NATIVE_APP while cookie-sync loads (no inspector)...`);
+      let cookieSyncDetected = false;
+      
+      // Phase 1: Poll for the InAppBrowser to appear (up to 15s)
+      for (let i = 0; i < 15; i++) {
+        await this.browser.pause(1000);
+        const ctxs = (await this.browser.getContexts() as string[]).map(String);
+        const wvs = ctxs.filter(c => c.includes("WEBVIEW"));
+        if (wvs.length > 1) {
+          cookieSyncDetected = true;
+          console.log(`[OAuthFlowManager] iOS: Cookie-sync InAppBrowser appeared after ${i + 1}s (${wvs.length} webviews)`);
+          break;
+        }
+      }
+      
+      if (cookieSyncDetected) {
+        // Phase 2: Let it load without ANY inspector interference.
+        // Manually this takes <2s; we give 5s as buffer.
+        const loadPause = 5;
+        console.log(`[OAuthFlowManager] iOS: Waiting ${loadPause}s for cookie-sync to load (NATIVE_APP, no inspector)...`);
+        await this.browser.pause(loadPause * 1000);
+        console.log(`[OAuthFlowManager] iOS: Cookie-sync window complete`);
+      } else {
+        console.log(`[OAuthFlowManager] iOS: No cookie-sync InAppBrowser appeared in 15s, proceeding`);
+      }
+    }
+    
+    // NOW connect the inspector by switching to the app webview
     console.log(`[OAuthFlowManager] Switching to app webview: ${targetWebview}`);
     await this.browser.switchContext(targetWebview);
-    await this.browser.pause(1000);
     
-    // Verify URL
+    // Now it's safe to inject wdi5 — cookie sync is done (or didn't happen)
+    console.log(`[OAuthFlowManager] Re-injecting wdi5 bridge...`);
     try {
-      const currentUrl = await this.browser.getUrl();
-      console.log(`[OAuthFlowManager] URL after switch: ${currentUrl}`);
-      if (!currentUrl.startsWith("file://")) {
-        console.log(`[OAuthFlowManager] WARNING: Unexpected URL (expected file://)`);
-      }
+      await this.browser.injectUI5();
+      console.log(`[OAuthFlowManager] wdi5 bridge re-injected successfully`);
     } catch (e) {
-      console.log(`[OAuthFlowManager] Could not get URL: ${e}`);
-    }
-    
-    // iOS: One more dialog check before wdi5 injection
-    if (this.isIOS()) {
+      console.error(`[OAuthFlowManager] wdi5 injection failed: ${e}`);
+      await this.browser.pause(1500);
       try {
-       // await this.browser.acceptAlert();
-       // console.log(`[OAuthFlowManager] iOS: Cleared late dialog`);
-        await this.browser.pause(500);
-      } catch {
-        // No dialog
-      }
-    }
-    
-    // iOS: Aggressive recovery to reset corrupted Safari Remote Debugger state
-    // The Safari debugger connection gets corrupted after external Safari closes
-    if (this.isIOS()) {
-      console.log(`[OAuthFlowManager] iOS: Starting aggressive webview recovery...`);
-      
-      // Step 1: Multiple context switches to reset WebDriver state
-      for (let i = 0; i < 2; i++) {
-        try {
-          await this.browser.switchContext("NATIVE_APP");
-          await this.browser.pause(500);
-          await this.browser.switchContext(targetWebview);
-          await this.browser.pause(500);
-        } catch (e) {
-          console.log(`[OAuthFlowManager] iOS: Context reset ${i + 1}: ${e}`);
-        }
-      }
-      
-      // Step 2: Clear any lingering dialogs
-      for (let i = 0; i < 3; i++) {
-        try { await this.browser.acceptAlert(); await this.browser.pause(300); } catch { break; }
-      }
-      
-      // Step 3: Multiple warmup execute calls to re-establish debugger connection
-      console.log(`[OAuthFlowManager] iOS: Warming up Safari debugger connection...`);
-      let warmupSuccess = false;
-      for (let attempt = 0; attempt < 5; attempt++) {
-        try {
-          // Use multiple simple sync execute calls to "prime" the connection
-          await this.browser.execute(() => true);
-          await this.browser.execute(() => document.readyState);
-          await this.browser.execute(() => window.location.href);
-          const hasSap = await this.browser.execute(() => typeof (window as any).sap !== "undefined");
-          console.log(`[OAuthFlowManager] iOS: Warmup ${attempt + 1} succeeded, hasSap=${hasSap}`);
-          warmupSuccess = true;
-          break;
-        } catch (e) {
-          console.log(`[OAuthFlowManager] iOS: Warmup ${attempt + 1} failed: ${e}`);
-          await this.browser.pause(1500);
-          
-          // Try context reset on failure
-          try {
-            await this.browser.switchContext("NATIVE_APP");
-            await this.browser.pause(300);
-            try { await this.browser.acceptAlert(); } catch { /* ignore */ }
-            await this.browser.switchContext(targetWebview);
-            await this.browser.pause(500);
-          } catch { /* ignore */ }
-        }
-      }
-      
-      if (!warmupSuccess) {
-        console.error(`[OAuthFlowManager] iOS: Warmup failed after all attempts!`);
-      }
-      
-      // Step 4: Extra stabilization wait
-      await this.browser.pause(1000);
-    }
-    
-    // Re-inject wdi5 - CRITICAL for UI5 interactions after OAuth
-    console.log(`[OAuthFlowManager] Re-injecting wdi5...`);
-    let wdi5Injected = false;
-    
-    // iOS needs more attempts and longer delays due to Safari debugger instability
-    const maxAttempts = this.isIOS() ? 5 : 3;
-    const retryDelay = this.isIOS() ? 3000 : 2000;
-    
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      try {
-        // iOS: One more warmup check before each injection attempt
-        if (this.isIOS() && attempt > 0) {
-          console.log(`[OAuthFlowManager] iOS: Pre-injection warmup for attempt ${attempt + 1}...`);
-          try {
-            await this.browser.execute(() => true);
-            await this.browser.execute(() => document.readyState);
-          } catch (warmupErr) {
-            console.log(`[OAuthFlowManager] iOS: Pre-injection warmup failed: ${warmupErr}`);
-            // Continue anyway, the actual injection might work
-          }
-        }
-        
         await this.browser.injectUI5();
-        await this.browser.pause(TIMEOUTS.postInjection);
-        console.log(`[OAuthFlowManager] wdi5 injected successfully (attempt ${attempt + 1})`);
-        wdi5Injected = true;
-        break;
-      } catch (e) {
-        console.error(`[OAuthFlowManager] wdi5 injection attempt ${attempt + 1}/${maxAttempts} failed: ${e}`);
-        
-        if (attempt < maxAttempts - 1) {
-          // Wait longer between retries
-          console.log(`[OAuthFlowManager] Waiting ${retryDelay}ms before retry...`);
-          await this.browser.pause(retryDelay);
-          
-          // iOS: Aggressive context reset between attempts
-          if (this.isIOS() && targetWebview) {
-            try {
-              console.log(`[OAuthFlowManager] iOS: Full context reset before retry...`);
-              
-              // Switch to NATIVE_APP
-              await this.browser.switchContext("NATIVE_APP");
-              await this.browser.pause(500);
-              
-              // Clear any dialogs
-              for (let d = 0; d < 3; d++) {
-                try { await this.browser.acceptAlert(); await this.browser.pause(200); } catch { break; }
-              }
-              
-              // Switch back to webview
-              await this.browser.switchContext(targetWebview);
-              await this.browser.pause(1000);
-              
-              // Try to verify we can execute in this context
-              try {
-                const ready = await this.browser.execute(() => document.readyState);
-                console.log(`[OAuthFlowManager] iOS: Context reset successful, readyState=${ready}`);
-              } catch (execErr) {
-                console.log(`[OAuthFlowManager] iOS: Post-reset execute failed: ${execErr}`);
-              }
-            } catch (ctxErr) {
-              console.log(`[OAuthFlowManager] iOS: Context reset failed: ${ctxErr}`);
-            }
-          }
-        }
-      }
-    }
-    
-    if (!wdi5Injected) {
-      console.error(`[OAuthFlowManager] WARNING: wdi5 injection failed after ${maxAttempts} attempts!`);
-      console.error(`[OAuthFlowManager] UI5 controls may not work properly.`);
-      
-      // iOS: Last resort - try a simple fallback approach
-      if (this.isIOS()) {
-        console.log(`[OAuthFlowManager] iOS: Attempting fallback wdi5 setup...`);
-        try {
-          // Wait for page to be fully loaded
-          await this.browser.pause(2000);
-          
-          // Check if UI5 is already available
-          const hasUI5 = await this.browser.execute(() => {
-            return typeof (window as any).sap !== "undefined" && 
-                   typeof (window as any).sap.ui !== "undefined";
-          });
-          
-          if (hasUI5) {
-            console.log(`[OAuthFlowManager] iOS: UI5 is present, attempting direct bridge injection...`);
-            // Try one more time after confirming UI5 is there
-            try {
-              await this.browser.injectUI5();
-              console.log(`[OAuthFlowManager] iOS: Fallback injection succeeded!`);
-              wdi5Injected = true;
-            } catch (finalErr) {
-              console.error(`[OAuthFlowManager] iOS: Fallback injection also failed: ${finalErr}`);
-            }
-          } else {
-            console.error(`[OAuthFlowManager] iOS: UI5 not present in webview!`);
-          }
-        } catch (fallbackErr) {
-          console.error(`[OAuthFlowManager] iOS: Fallback check failed: ${fallbackErr}`);
-        }
+        console.log(`[OAuthFlowManager] wdi5 bridge re-injected on retry`);
+      } catch (e2) {
+        console.error(`[OAuthFlowManager] wdi5 injection retry also failed: ${e2}`);
       }
     }
     

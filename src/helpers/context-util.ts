@@ -168,6 +168,25 @@ export class ContextUtil {
   }
 
   /**
+   * Externally set the main app context.
+   * Used by OAuthFlowManager to share the known app webview with ContextUtil
+   * so we never have to probe for it.
+   */
+  public setMainAppContext(contextName: string): void {
+    this.mainAppContext = contextName;
+    const appId = contextName.match(/WEBVIEW_(.+)/i)?.[1];
+    if (appId) this.mainAppId = appId;
+    console.log(`[ContextUtil] Main app context set externally: ${contextName}`);
+  }
+
+  /**
+   * Get the cached main app context name.
+   */
+  public getMainAppContext(): string | undefined {
+    return this.mainAppContext;
+  }
+
+  /**
    * Get the browser/driver instance.
    */
   private get browser(): WebdriverIO.Browser {
@@ -197,7 +216,7 @@ export class ContextUtil {
     return "unknown";
   }
 
-  // ==================== Context Information ====================
+  // ==================== Context Information ===================
 
   /**
    * Get the current context name.
@@ -381,8 +400,11 @@ export class ContextUtil {
    * Detection strategy (in order):
    * 1. Use cached context if available
    * 2. Heuristic match (Android package name contains "neptune")
-   * 3. Probe each webview for `window.neptune` global (definitive)
-   * 4. Fallback to the first non-browser webview
+   * 3. On iOS: use the lowest-numbered webview (main app always gets the first webview;
+   *    InAppBrowser/cookie-sync webviews get higher IDs). This avoids the extremely
+   *    slow and driver-state-corrupting context-switch-and-probe approach.
+   * 4. On Android: probe each webview for `window.neptune` global (definitive)
+   * 5. Fallback to the first non-browser webview
    */
   public async switchToMainWebview(
     options: ContextSwitchOptions = {},
@@ -395,6 +417,7 @@ export class ContextUtil {
         await this.switchToContext(this.mainAppContext);
         return;
       } catch {
+        console.log(`[ContextUtil] Cached context ${this.mainAppContext} is stale, clearing`);
         this.mainAppContext = undefined;
       }
     }
@@ -423,7 +446,19 @@ export class ContextUtil {
           return true;
         }
 
-        // Probe each webview for window.neptune (definitive but slower)
+        // iOS: Use lowest-numbered webview. On iOS, webview IDs are like
+        // WEBVIEW_37630.2, WEBVIEW_37630.4 - the main app always gets the 
+        // lowest-numbered webview. InAppBrowser / cookie-sync webviews get
+        // higher IDs. This avoids the extremely slow and destructive probing
+        // that switches to each context and runs execute().
+        if (this.isIOS()) {
+          const sorted = this.sortWebviewsByIdAscending(webviewNames);
+          this.mainAppContext = sorted[0];
+          console.log(`[ContextUtil] iOS: Using lowest-numbered webview: ${this.mainAppContext} (from ${sorted.length} webviews)`);
+          return true;
+        }
+
+        // Android: Probe each webview for window.neptune (safe on Android)
         console.log(`[ContextUtil] Probing ${webviewNames.length} webviews for Neptune app...`);
         for (const name of webviewNames) {
           if (await this.probeForNeptuneApp(name)) {
@@ -451,6 +486,32 @@ export class ContextUtil {
   }
 
   /**
+   * Sort webview context names by their numeric ID in ascending order.
+   * iOS webview names look like WEBVIEW_37630.2, WEBVIEW_37630.4, etc.
+   */
+  private sortWebviewsByIdAscending(webviewNames: string[]): string[] {
+    return [...webviewNames].sort((a, b) => {
+      const idA = this.extractWebviewNumericId(a);
+      const idB = this.extractWebviewNumericId(b);
+      return idA - idB;
+    });
+  }
+
+  /**
+   * Extract a sortable numeric ID from a webview context name.
+   * WEBVIEW_37630.2 -> 3763000.2, WEBVIEW_37630.4 -> 3763000.4
+   */
+  private extractWebviewNumericId(contextName: string): number {
+    const match = contextName.match(/WEBVIEW_(\d+)\.?(\d*)/i);
+    if (match) {
+      const major = parseInt(match[1], 10);
+      const minor = parseInt(match[2] || "0", 10);
+      return major * 100 + minor;
+    }
+    return 0;
+  }
+
+  /**
    * Ensure we're in the main app webview.
    * Switches if necessary.
    * 
@@ -460,14 +521,9 @@ export class ContextUtil {
   public async ensureInWebview(
     options: ContextSwitchOptions = {},
   ): Promise<void> {
-    // iOS: Wait for any InAppBrowser cookie sync to complete
-    if (this.isIOS()) {
-      await this.waitForInAppBrowserToClose();
-    }
-
     const currentName = await this.getCurrentContextName();
 
-    // If we already know this is the main app context, skip
+    // If we already know this is the main app context, skip the search
     if (currentName === this.mainAppContext && !options.forceInject) {
       if (options.injectUI5) {
         await this.injectUI5(false);
@@ -475,8 +531,22 @@ export class ContextUtil {
       return;
     }
 
+    // If we have a cached context and we're not in it, switch directly
+    if (this.mainAppContext && currentName !== this.mainAppContext) {
+      try {
+        await this.switchToContext(this.mainAppContext);
+        if (options.injectUI5 || options.forceInject) {
+          await this.injectUI5(options.forceInject ?? false);
+        }
+        return;
+      } catch {
+        console.log(`[ContextUtil] Cached context ${this.mainAppContext} is stale, clearing`);
+        this.mainAppContext = undefined;
+      }
+    }
+
     // If we're in a webview but don't know if it's the main app,
-    // probe it instead of blindly switching away
+    // probe the current context only (not other contexts) to check
     if (currentName.includes("WEBVIEW") && !this.mainAppContext) {
       try {
         const hasNeptune = await this.browser.execute(() => {
@@ -493,7 +563,7 @@ export class ContextUtil {
           return;
         }
       } catch {
-        // execute failed, need to switch
+        // execute failed on current context, need to find the right one
       }
     }
 
@@ -508,56 +578,39 @@ export class ContextUtil {
   /**
    * Wait for any InAppBrowser (extra webview) to close.
    *
-   * This handles scenarios where the framework opens InAppBrowser:
-   * - iOS cookie sync after PIN entry
-   * - Background auth refresh
-   * - Token validation
-   *
-   * The InAppBrowser should close automatically once the operation completes.
-   * If it appears stuck (blank screen), this method will attempt to recover.
+   * IMPORTANT: This method only monitors the context list count without
+   * switching to any extra webview contexts. Switching to a stale or
+   * blank InAppBrowser is extremely slow on iOS and corrupts the
+   * XCUITest/Appium driver state.
    *
    * @param timeout - Maximum time to wait in ms (default 30s)
-   * @param expectedWebviewCount - Expected number of webviews after close (default 2)
+   * @param expectedWebviewCount - Expected number of webviews when done (default 1)
    */
   public async waitForInAppBrowserToClose(
     timeout: number = 30000,
-    expectedWebviewCount: number = 2,
+    expectedWebviewCount: number = 1,
   ): Promise<void> {
     const startTime = Date.now();
     const pollInterval = 1000;
-    const stuckThreshold = 10000; // Consider stuck if no change for 10s
-    let lastChangeTime = Date.now();
-    let lastWebviewCount = 0;
-    let stuckWebviewUrl: string | null = null;
 
-    // First check if there are extra webviews that might be InAppBrowser
     let contexts = await this.getAllContextNames();
     let webviewContexts = contexts.filter(
       (c) => c.includes("WEBVIEW") && !c.toLowerCase().includes("chrome"),
     );
 
-    // If we have 3+ webviews on iOS, one might be InAppBrowser for cookie sync
-    // Normal state: NATIVE_APP + 1-2 app webviews
-    // Cookie sync state: NATIVE_APP + 2-3 webviews (extra one is InAppBrowser)
     const initialWebviewCount = webviewContexts.length;
-    lastWebviewCount = initialWebviewCount;
 
-    if (initialWebviewCount <= 2) {
-      // Normal state, no extra webviews
+    if (initialWebviewCount <= expectedWebviewCount) {
       console.log(
-        `[ContextUtil] iOS: No extra webviews detected (${initialWebviewCount}), cookie sync not needed`,
+        `[ContextUtil] iOS: ${initialWebviewCount} webview(s), no extra InAppBrowser detected`,
       );
       return;
     }
 
     console.log(
-      `[ContextUtil] iOS: Detected ${initialWebviewCount} webviews, waiting for InAppBrowser cookie sync...`,
+      `[ContextUtil] iOS: Detected ${initialWebviewCount} webviews (expected ${expectedWebviewCount}), waiting for InAppBrowser to close...`,
     );
 
-    // Capture the original/main app webview to return to later
-    const mainAppWebview = this.mainAppContext || webviewContexts[0];
-
-    // Wait for webview count to decrease (InAppBrowser closing)
     while (Date.now() - startTime < timeout) {
       await this.browser.pause(pollInterval);
 
@@ -566,74 +619,12 @@ export class ContextUtil {
         (c) => c.includes("WEBVIEW") && !c.toLowerCase().includes("chrome"),
       );
 
-      if (webviewContexts.length !== lastWebviewCount) {
-        lastChangeTime = Date.now();
-        lastWebviewCount = webviewContexts.length;
-      }
-
-      if (webviewContexts.length < initialWebviewCount) {
+      if (webviewContexts.length <= expectedWebviewCount) {
         console.log(
           `[ContextUtil] iOS: InAppBrowser closed (webviews: ${initialWebviewCount} -> ${webviewContexts.length})`,
         );
         await this.browser.pause(500);
         return;
-      }
-
-      // Check if stuck (no change for too long)
-      const stuckDuration = Date.now() - lastChangeTime;
-      if (stuckDuration > stuckThreshold) {
-        console.log(
-          `[ContextUtil] iOS: InAppBrowser appears stuck (no change for ${Math.round(stuckDuration / 1000)}s)`,
-        );
-
-        // Try to diagnose the stuck state
-        const extraWebviews = webviewContexts.filter(
-          (w) => w !== mainAppWebview,
-        );
-
-        for (const ctx of extraWebviews) {
-          try {
-            await this.browser.switchContext(ctx);
-            const url = await this.browser.getUrl();
-            console.log(`[ContextUtil] iOS: Stuck webview ${ctx} URL: ${url}`);
-            stuckWebviewUrl = url;
-
-            // If it's a blank or about:blank page, the cookie sync likely failed
-            if (url === "about:blank" || url === "" || !url) {
-              console.log(
-                `[ContextUtil] iOS: InAppBrowser shows blank - cookie sync may have failed`,
-              );
-
-              // Try to close the InAppBrowser by navigating back to main webview
-              // The framework should eventually close it
-            }
-          } catch (e) {
-            console.log(
-              `[ContextUtil] iOS: Cannot access stuck webview ${ctx}: ${e}`,
-            );
-          }
-        }
-
-        // After diagnosing, switch back to main app webview
-        try {
-          await this.browser.switchContext(mainAppWebview);
-        } catch (e) {
-          console.log(
-            `[ContextUtil] iOS: Failed to switch back to main webview: ${e}`,
-          );
-        }
-
-        // If stuck for too long, break out and let the test continue
-        // The framework may eventually close the InAppBrowser
-        if (stuckDuration > 20000) {
-          console.log(
-            `[ContextUtil] iOS: InAppBrowser stuck for too long, proceeding anyway`,
-          );
-          console.log(
-            `[ContextUtil] iOS: Last known stuck URL: ${stuckWebviewUrl}`,
-          );
-          return;
-        }
       }
 
       const elapsed = Math.round((Date.now() - startTime) / 1000);
@@ -645,21 +636,11 @@ export class ContextUtil {
     }
 
     console.log(
-      `[ContextUtil] iOS: Timeout waiting for InAppBrowser to close after ${Math.round(timeout / 1000)}s`,
+      `[ContextUtil] iOS: Timeout waiting for InAppBrowser to close after ${Math.round(timeout / 1000)}s (webviews: ${webviewContexts.length})`,
     );
     console.log(
-      `[ContextUtil] iOS: Current webview count: ${webviewContexts.length}, expected: ${expectedWebviewCount}`,
+      `[ContextUtil] iOS: Proceeding anyway — will switch to main app webview`,
     );
-
-    // Switch back to main app webview before returning
-    try {
-      await this.browser.switchContext(mainAppWebview);
-      console.log(
-        `[ContextUtil] iOS: Switched back to main app webview: ${mainAppWebview}`,
-      );
-    } catch (e) {
-      console.log(`[ContextUtil] iOS: Failed to switch to main webview: ${e}`);
-    }
   }
 
   /**
