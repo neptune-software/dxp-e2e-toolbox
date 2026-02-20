@@ -1294,38 +1294,50 @@ export class OAuthFlowManager {
     console.log(`[OAuthFlowManager] Returning to app (${browserMode} mode)...`);
     
     // Android InAppBrowser: the OAuth page was a window inside the app's
-    // webview context. After the OAuth login completes, the InAppBrowser
-    // closes its window automatically. We need to switch back to the app's
-    // original window handle and wait for the InAppBrowser window to close.
+    // webview context. After login, the OAuth provider redirects, and the
+    // InAppBrowser either closes or navigates away from the OAuth URL.
+    // The window handle often persists as a stale reference even after
+    // the InAppBrowser visually closes — so instead of waiting for the
+    // handle to disappear (which can take forever), we check the URL of
+    // the OAuth window: once it's no longer an OAuth URL, we're done.
     if (!this.isIOS() && browserMode === "inappbrowser" && this._androidAppWindowHandle) {
-      console.log(`[OAuthFlowManager] Android: Waiting for InAppBrowser to close...`);
+      console.log(`[OAuthFlowManager] Android: Waiting for InAppBrowser redirect/close...`);
       
-      // Wait for the OAuth provider to process and redirect/close
       await this.browser.pause(TIMEOUTS.returnToApp.android);
       
-      // Poll for the InAppBrowser window to disappear
-      const closeStart = Date.now();
-      const closeTimeout = 30000;
-      while (Date.now() - closeStart < closeTimeout) {
-        try {
-          const handles = await this.browser.getWindowHandles();
-          console.log(`[OAuthFlowManager] Android: Window handles: ${JSON.stringify(handles)}`);
-          
-          if (this._androidOAuthWindowHandle && !handles.includes(this._androidOAuthWindowHandle)) {
-            console.log(`[OAuthFlowManager] Android: InAppBrowser window closed`);
+      // Quick check: did the OAuth window close or redirect?
+      if (this._androidOAuthWindowHandle) {
+        for (let i = 0; i < 10; i++) {
+          try {
+            const handles = await this.browser.getWindowHandles();
+            
+            // Handle disappeared — InAppBrowser closed cleanly
+            if (!handles.includes(this._androidOAuthWindowHandle)) {
+              console.log(`[OAuthFlowManager] Android: InAppBrowser window closed after ${i}s`);
+              break;
+            }
+            
+            if (handles.length <= 1) {
+              console.log(`[OAuthFlowManager] Android: Single window remaining`);
+              break;
+            }
+            
+            // Handle still exists — check its URL to see if OAuth completed
+            await this.browser.switchToWindow(this._androidOAuthWindowHandle);
+            const url = await this.browser.getUrl();
+            if (!await this.isOAuthUrl(url)) {
+              console.log(`[OAuthFlowManager] Android: InAppBrowser redirected away from OAuth (${url.substring(0, 60)}…)`);
+              break;
+            }
+            
+            console.log(`[OAuthFlowManager] Android: Still on OAuth URL, waiting... (${i}s)`);
+          } catch {
+            // Window became inaccessible — it's closed
+            console.log(`[OAuthFlowManager] Android: InAppBrowser window no longer accessible`);
             break;
           }
-          
-          // If only one handle left, the InAppBrowser is gone
-          if (handles.length <= 1) {
-            console.log(`[OAuthFlowManager] Android: Single window remaining`);
-            break;
-          }
-        } catch (e) {
-          console.log(`[OAuthFlowManager] Android: Window handle poll error: ${e}`);
-          break;
+          await this.browser.pause(1000);
         }
-        await this.browser.pause(1000);
       }
       
       // Switch back to the app's window
@@ -1334,7 +1346,6 @@ export class OAuthFlowManager {
         console.log(`[OAuthFlowManager] Android: Switched back to app window: ${this._androidAppWindowHandle}`);
       } catch (e) {
         console.log(`[OAuthFlowManager] Android: Could not switch to app window: ${e}`);
-        // Fallback: get current handles and switch to the first one
         try {
           const handles = await this.browser.getWindowHandles();
           if (handles.length > 0) {
@@ -1344,7 +1355,6 @@ export class OAuthFlowManager {
         } catch { /* ignore */ }
       }
       
-      // Clean up state
       this._androidAppWindowHandle = undefined;
       this._androidOAuthWindowHandle = undefined;
       
