@@ -725,6 +725,18 @@ export class OAuthFlowManager {
       throw new Error(`[OAuthFlowManager] No OAuth context found after ${timeout}ms`);
     }
     
+    // On Android, Cordova InAppBrowser opens as a new WINDOW within the
+    // existing app webview context — not as a new context. The context list
+    // stays the same (e.g., ["NATIVE_APP", "WEBVIEW_com.neptune.azure"]).
+    // We need to switch into the webview context and poll getWindowHandles()
+    // for a new window handle to appear, then switch to it.
+    const androidInAppBrowser = !this.isIOS() && browserMode === "inappbrowser";
+    
+    if (androidInAppBrowser) {
+      console.log(`[OAuthFlowManager] Android InAppBrowser: Detecting via window handles...`);
+      return this.findAndroidInAppBrowserWindow(timeout);
+    }
+    
     // Helper to get numeric webview ID for sorting
     const getWebviewId = (ctx: string): number => {
       const match = String(ctx).match(/WEBVIEW_(\d+)\.?(\d*)/);
@@ -1024,6 +1036,98 @@ export class OAuthFlowManager {
   }
   
   /**
+   * Find the Android InAppBrowser via window handles and URL inspection.
+   *
+   * On Android, Cordova InAppBrowser runs inside the app's WebView process.
+   * It shares the same context (e.g., WEBVIEW_com.neptune.azure) but opens
+   * as a new window handle within that context.
+   *
+   * The InAppBrowser may already be open by the time we start looking
+   * (the login click + postLoginClick pause gives it time to open), so we
+   * can't rely on detecting "new" handles. Instead we check the URL of
+   * ALL non-app window handles on every poll cycle.
+   *
+   * Strategy:
+   * 1. Switch to the app's webview context
+   * 2. Identify the current app window handle (our main page)
+   * 3. Poll all window handles — check each non-app handle's URL for OAuth
+   * 4. Also check for new handles appearing (InAppBrowser may open later)
+   */
+  private async findAndroidInAppBrowserWindow(timeout: number): Promise<Context> {
+    const startTime = Date.now();
+    
+    // Switch to the app's webview context to access window handles
+    if (this.appContext) {
+      console.log(`[OAuthFlowManager] Android: Switching to app context: ${this.appContext}`);
+      await this.browser.switchContext(String(this.appContext));
+    } else {
+      const contexts = await this.browser.getContexts() as string[];
+      const webview = contexts.map(String).find(c => 
+        c.includes("WEBVIEW") && !c.toLowerCase().includes("terrace")
+      );
+      if (webview) {
+        console.log(`[OAuthFlowManager] Android: Switching to webview: ${webview}`);
+        await this.browser.switchContext(webview);
+      }
+    }
+    
+    // Store the current (app) window handle so we can switch back later
+    let appWindowHandle: string | undefined;
+    try {
+      appWindowHandle = await this.browser.getWindowHandle();
+      console.log(`[OAuthFlowManager] Android: App window handle: ${appWindowHandle}`);
+    } catch { /* ignore */ }
+    
+    while (Date.now() - startTime < timeout) {
+      const elapsedSec = Math.round((Date.now() - startTime) / 1000);
+      
+      try {
+        const currentHandles = await this.browser.getWindowHandles();
+        console.log(`[OAuthFlowManager] [${elapsedSec}s] Android: ${currentHandles.length} window handle(s)`);
+        
+        // Check each handle's URL — skip the app window
+        for (const handle of currentHandles) {
+          if (handle === appWindowHandle) continue;
+          
+          try {
+            await this.browser.switchToWindow(handle);
+            await this.browser.pause(300);
+            
+            const url = await this.browser.getUrl();
+            console.log(`[OAuthFlowManager] [${elapsedSec}s] Android: Window ${handle.substring(0, 8)}… URL: ${url}`);
+            
+            if (await this.isOAuthUrl(url)) {
+              console.log(`[OAuthFlowManager] Android: Found OAuth in window ${handle}`);
+              await this.stabilizeOAuthContext();
+              this._androidAppWindowHandle = appWindowHandle;
+              this._androidOAuthWindowHandle = handle;
+              return String(this.appContext || "WEBVIEW") as Context;
+            }
+          } catch (e) {
+            console.log(`[OAuthFlowManager] [${elapsedSec}s] Android: Window ${handle.substring(0, 8)}… check failed: ${e}`);
+          }
+        }
+        
+        // No OAuth found yet — switch back to app window before next poll
+        if (appWindowHandle) {
+          try { await this.browser.switchToWindow(appWindowHandle); } catch { /* ignore */ }
+        }
+      } catch (e) {
+        console.log(`[OAuthFlowManager] [${elapsedSec}s] Android: Window handle poll error: ${e}`);
+      }
+      
+      await this.browser.pause(TIMEOUTS.pollInterval);
+    }
+    
+    throw new Error(`[OAuthFlowManager] Android: No InAppBrowser OAuth window found after ${timeout}ms`);
+  }
+  
+  // Android InAppBrowser state — saved during detection so returnToAppAndRestore
+  // can switch back to the correct window
+  private _androidAppWindowHandle?: string;
+  private _androidOAuthWindowHandle?: string;
+  
+  /**
    * Find webview context (Android or InAppBrowser)
    */
   private async findWebviewContext(
@@ -1188,6 +1292,81 @@ export class OAuthFlowManager {
    */
   private async returnToAppAndRestore(browserMode: OAuthBrowserMode): Promise<void> {
     console.log(`[OAuthFlowManager] Returning to app (${browserMode} mode)...`);
+    
+    // Android InAppBrowser: the OAuth page was a window inside the app's
+    // webview context. After the OAuth login completes, the InAppBrowser
+    // closes its window automatically. We need to switch back to the app's
+    // original window handle and wait for the InAppBrowser window to close.
+    if (!this.isIOS() && browserMode === "inappbrowser" && this._androidAppWindowHandle) {
+      console.log(`[OAuthFlowManager] Android: Waiting for InAppBrowser to close...`);
+      
+      // Wait for the OAuth provider to process and redirect/close
+      await this.browser.pause(TIMEOUTS.returnToApp.android);
+      
+      // Poll for the InAppBrowser window to disappear
+      const closeStart = Date.now();
+      const closeTimeout = 30000;
+      while (Date.now() - closeStart < closeTimeout) {
+        try {
+          const handles = await this.browser.getWindowHandles();
+          console.log(`[OAuthFlowManager] Android: Window handles: ${JSON.stringify(handles)}`);
+          
+          if (this._androidOAuthWindowHandle && !handles.includes(this._androidOAuthWindowHandle)) {
+            console.log(`[OAuthFlowManager] Android: InAppBrowser window closed`);
+            break;
+          }
+          
+          // If only one handle left, the InAppBrowser is gone
+          if (handles.length <= 1) {
+            console.log(`[OAuthFlowManager] Android: Single window remaining`);
+            break;
+          }
+        } catch (e) {
+          console.log(`[OAuthFlowManager] Android: Window handle poll error: ${e}`);
+          break;
+        }
+        await this.browser.pause(1000);
+      }
+      
+      // Switch back to the app's window
+      try {
+        await this.browser.switchToWindow(this._androidAppWindowHandle);
+        console.log(`[OAuthFlowManager] Android: Switched back to app window: ${this._androidAppWindowHandle}`);
+      } catch (e) {
+        console.log(`[OAuthFlowManager] Android: Could not switch to app window: ${e}`);
+        // Fallback: get current handles and switch to the first one
+        try {
+          const handles = await this.browser.getWindowHandles();
+          if (handles.length > 0) {
+            await this.browser.switchToWindow(handles[0]);
+            console.log(`[OAuthFlowManager] Android: Fallback to first window: ${handles[0]}`);
+          }
+        } catch { /* ignore */ }
+      }
+      
+      // Clean up state
+      this._androidAppWindowHandle = undefined;
+      this._androidOAuthWindowHandle = undefined;
+      
+      // Re-inject wdi5
+      console.log(`[OAuthFlowManager] Re-injecting wdi5 bridge...`);
+      try {
+        await this.browser.injectUI5();
+        console.log(`[OAuthFlowManager] wdi5 bridge re-injected successfully`);
+      } catch (e) {
+        console.error(`[OAuthFlowManager] wdi5 injection failed: ${e}`);
+        await this.browser.pause(1500);
+        try {
+          await this.browser.injectUI5();
+          console.log(`[OAuthFlowManager] wdi5 bridge re-injected on retry`);
+        } catch (e2) {
+          console.error(`[OAuthFlowManager] wdi5 injection retry also failed: ${e2}`);
+        }
+      }
+      
+      console.log(`[OAuthFlowManager] Back in app`);
+      return;
+    }
     
     const waitTime = this.isIOS() ? 3000 : TIMEOUTS.returnToApp.android;
     console.log(`[OAuthFlowManager] Waiting ${waitTime}ms for OAuth browser to close...`);
