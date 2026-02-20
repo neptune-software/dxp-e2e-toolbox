@@ -742,7 +742,14 @@ export class OAuthFlowManager {
       console.log(`[OAuthFlowManager] [${elapsedSec}s] Contexts: ${JSON.stringify(currentContexts)}`);
       
       if (browserMode === "native" && this.isIOS()) {
-        // iOS Native: Detect Safari sheet via native elements
+        // iOS Native (ASWebAuthenticationSession): Safari runs in a separate
+        // process with its own PID. Use mobile: getContexts to find the OAuth
+        // page without attaching the inspector, then switch to the best
+        // candidate (highest page number = most likely the visible page).
+        const safariCtx = await this.findAndSwitchToSafariOAuth(elapsedSec);
+        if (safariCtx) return safariCtx;
+        
+        // Fallback: native element detection + manual webview switching
         const context = await this.findIOSNativeBrowserContext(currentContexts, getWebviewId);
         if (context) return context;
       } else {
@@ -758,7 +765,91 @@ export class OAuthFlowManager {
   }
   
   /**
-   * Find iOS native browser (Safari) context
+   * Find and switch to the Safari/ASWebAuthenticationSession OAuth page.
+   *
+   * Safari runs in a separate process (different PID than the app).
+   * It may expose multiple webview pages (.1, .2, .3, ...) — service workers,
+   * iframes, extensions, and the actual visible content page.
+   *
+   * Strategy:
+   * 1. Use `mobile: getContexts` to list all webviews with URLs (inspector-free)
+   * 2. Identify Safari webviews by their process PID (different from app's PID)
+   * 3. Find pages with OAuth URLs
+   * 4. Wait for Safari's Remote Inspector endpoint to be ready
+   * 5. Try switching, highest page number first (most likely the visible page)
+   */
+  private async findAndSwitchToSafariOAuth(elapsedSec: number): Promise<Context | null> {
+    try {
+      const detailed = await this.browser.execute('mobile: getContexts') as any[];
+      if (!Array.isArray(detailed)) return null;
+
+      // Determine the app's process prefix (e.g., "WEBVIEW_41648")
+      const appProcessPrefix = this.appContext
+        ? String(this.appContext).replace(/\.\d+$/, '')
+        : null;
+
+      const safariOAuthPages: string[] = [];
+
+      for (const ctx of detailed) {
+        if (!ctx?.id || !String(ctx.id).includes("WEBVIEW")) continue;
+
+        const ctxId = String(ctx.id);
+
+        // Skip the app's own webviews (same process prefix)
+        if (appProcessPrefix && ctxId.startsWith(appProcessPrefix + ".")) continue;
+
+        const url = ctx.url || "(no url)";
+        const title = ctx.title || "";
+        console.log(`[OAuthFlowManager] [${elapsedSec}s] Safari ${ctxId}: ${url} (${title})`);
+
+        if (ctx.url && await this.isOAuthUrl(ctx.url)) {
+          safariOAuthPages.push(ctxId);
+        }
+      }
+
+      if (safariOAuthPages.length === 0) return null;
+
+      // Try highest page number first — the main content page in Safari is
+      // typically the highest-numbered one; lower numbers may be service
+      // workers or background pages that can't be switched to.
+      safariOAuthPages.sort((a, b) => {
+        const aPage = parseInt(a.split('.').pop() || '0');
+        const bPage = parseInt(b.split('.').pop() || '0');
+        return bPage - aPage;
+      });
+
+      console.log(`[OAuthFlowManager] iOS Safari: OAuth page(s): ${JSON.stringify(safariOAuthPages)}`);
+
+      // Give Safari's Remote Inspector time to set up its debugging endpoint.
+      // mobile: getContexts finds pages very fast via the listing protocol,
+      // but the actual debugging connection needs more time.
+      if (elapsedSec < 3) {
+        console.log(`[OAuthFlowManager] iOS Safari: Waiting for inspector endpoint to be ready...`);
+        await this.browser.pause(3000);
+      }
+
+      for (const ctxId of safariOAuthPages) {
+        try {
+          console.log(`[OAuthFlowManager] iOS Safari: Switching to ${ctxId}...`);
+          await this.browser.switchContext(ctxId);
+          console.log(`[OAuthFlowManager] iOS Safari: Connected to ${ctxId}`);
+          await this.stabilizeOAuthContext();
+          return ctxId as Context;
+        } catch (e) {
+          console.log(`[OAuthFlowManager] iOS Safari: ${ctxId} switch failed: ${e}`);
+          try { await this.browser.switchContext("NATIVE_APP"); } catch { /* already native */ }
+        }
+      }
+
+      console.log(`[OAuthFlowManager] iOS Safari: All switch attempts failed, will retry...`);
+    } catch (e) {
+      console.log(`[OAuthFlowManager] [${elapsedSec}s] Safari detection error: ${e}`);
+    }
+    return null;
+  }
+
+  /**
+   * Find iOS native browser (Safari) context (legacy fallback)
    * 
    * iOS with ASWebAuthenticationSession:
    * - Opens Safari as a modal sheet (not a new app)
@@ -1169,31 +1260,35 @@ export class OAuthFlowManager {
     // InAppBrowser loads. Only switch to the app webview AFTER cookie sync
     // has had a clean window to complete. getContexts() is safe because it
     // uses the XCUITest driver, not the Remote Inspector.
+    //
+    // IMPORTANT: Use the current webview count as the baseline, NOT a
+    // hardcoded "1". The app may have multiple webviews at rest (e.g.,
+    // the main webview + a helper webview). A cookie-sync InAppBrowser
+    // causes the count to INCREASE beyond the baseline.
     if (this.isIOS()) {
-      console.log(`[OAuthFlowManager] iOS: Staying in NATIVE_APP while cookie-sync loads (no inspector)...`);
+      const baselineWebviews = contexts.map(String).filter(c => c.includes("WEBVIEW"));
+      const baselineCount = baselineWebviews.length;
+      console.log(`[OAuthFlowManager] iOS: Monitoring for cookie-sync (baseline: ${baselineCount} webviews)...`);
       let cookieSyncDetected = false;
       
-      // Phase 1: Poll for the InAppBrowser to appear (up to 15s)
       for (let i = 0; i < 15; i++) {
         await this.browser.pause(1000);
         const ctxs = (await this.browser.getContexts() as string[]).map(String);
         const wvs = ctxs.filter(c => c.includes("WEBVIEW"));
-        if (wvs.length > 1) {
+        if (wvs.length > baselineCount) {
           cookieSyncDetected = true;
-          console.log(`[OAuthFlowManager] iOS: Cookie-sync InAppBrowser appeared after ${i + 1}s (${wvs.length} webviews)`);
+          console.log(`[OAuthFlowManager] iOS: Cookie-sync InAppBrowser appeared after ${i + 1}s (${wvs.length} vs baseline ${baselineCount})`);
           break;
         }
       }
       
       if (cookieSyncDetected) {
-        // Phase 2: Let it load without ANY inspector interference.
-        // Manually this takes <2s; we give 5s as buffer.
         const loadPause = 5;
         console.log(`[OAuthFlowManager] iOS: Waiting ${loadPause}s for cookie-sync to load (NATIVE_APP, no inspector)...`);
         await this.browser.pause(loadPause * 1000);
         console.log(`[OAuthFlowManager] iOS: Cookie-sync window complete`);
       } else {
-        console.log(`[OAuthFlowManager] iOS: No cookie-sync InAppBrowser appeared in 15s, proceeding`);
+        console.log(`[OAuthFlowManager] iOS: No cookie-sync InAppBrowser detected, proceeding`);
       }
     }
     
