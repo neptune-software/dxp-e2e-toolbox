@@ -1457,6 +1457,7 @@ export class OAuthFlowManager {
     if (this.isIOS()) {
       const baselineWebviews = contexts.map(String).filter(c => c.includes("WEBVIEW"));
       const baselineCount = baselineWebviews.length;
+      const baselineSet = new Set(baselineWebviews);
       console.log(`[OAuthFlowManager] iOS: Monitoring for cookie-sync (baseline: ${baselineCount} webviews)...`);
       let cookieSyncDetected = false;
       
@@ -1469,6 +1470,14 @@ export class OAuthFlowManager {
           console.log(`[OAuthFlowManager] iOS: Cookie-sync InAppBrowser appeared after ${i + 1}s (${wvs.length} vs baseline ${baselineCount})`);
           break;
         }
+        // Cookie-sync sometimes replaces a helper webview instead of adding one,
+        // so the count stays the same but the ids change. Stay in NATIVE_APP.
+        const identityChanged = wvs.some((id) => !baselineSet.has(id));
+        if (identityChanged) {
+          cookieSyncDetected = true;
+          console.log(`[OAuthFlowManager] iOS: Cookie-sync webview identity changed after ${i + 1}s (count still ${wvs.length})`);
+          break;
+        }
       }
       
       if (cookieSyncDetected) {
@@ -1477,7 +1486,12 @@ export class OAuthFlowManager {
         await this.browser.pause(loadPause * 1000);
         console.log(`[OAuthFlowManager] iOS: Cookie-sync window complete`);
       } else {
-        console.log(`[OAuthFlowManager] iOS: No cookie-sync InAppBrowser detected, proceeding`);
+        // Sync may have finished during the IdP window. A short NATIVE_APP
+        // grace wait still avoids attaching the inspector too early (NAD iOS
+        // Azure/Okta: "No cookie-sync" then login assertion false).
+        const gracePause = 3;
+        console.log(`[OAuthFlowManager] iOS: No cookie-sync InAppBrowser detected, waiting ${gracePause}s in NATIVE_APP before attaching inspector`);
+        await this.browser.pause(gracePause * 1000);
       }
     }
     
