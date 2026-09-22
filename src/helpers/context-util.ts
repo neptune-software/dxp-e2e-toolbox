@@ -222,15 +222,81 @@ export class ContextUtil {
    * Get the current context name.
    */
   public async getCurrentContextName(): Promise<string> {
-    return (await this.browser.getContext()) as string;
+    const ctx = await this.browser.getContext();
+    return this.contextId(ctx);
   }
 
   /**
    * Get all available contexts.
    */
   public async getAllContextNames(): Promise<string[]> {
-    const contexts = await this.browser.getContexts();
-    return contexts as string[];
+    const contexts = (await this.browser.getContexts()) as unknown[];
+    if (this.isIOS()) {
+      console.log(`[iOS-trace] contexts: ${this.describeContexts(contexts)}`);
+    }
+    return contexts.map((c) => this.contextId(c));
+  }
+
+  private contextId(ctx: unknown): string {
+    if (typeof ctx === "string") return ctx;
+    if (ctx && typeof ctx === "object" && "id" in ctx) {
+      return String((ctx as { id: string }).id);
+    }
+    return String(ctx);
+  }
+
+  private describeContexts(contexts: unknown[]): string {
+    return contexts
+      .map((ctx) => {
+        if (typeof ctx === "string") return ctx;
+        if (ctx && typeof ctx === "object") {
+          const o = ctx as Record<string, unknown>;
+          const parts = [`id=${o.id ?? "?"}`];
+          if (o.title) parts.push(`title=${JSON.stringify(o.title)}`);
+          if (o.url) parts.push(`url=${JSON.stringify(o.url)}`);
+          if (o.bundleId) parts.push(`bundleId=${o.bundleId}`);
+          return `{${parts.join(" ")}}`;
+        }
+        return String(ctx);
+      })
+      .join(" | ");
+  }
+
+  /**
+   * One-shot iOS page/context dump. Uses a single sync execute on the *current*
+   * webview only (does not walk other WKWebViews).
+   */
+  public async traceIosState(label: string): Promise<void> {
+    if (!this.isIOS()) return;
+    let current = "?";
+    try {
+      current = await this.getCurrentContextName();
+    } catch (e) {
+      current = `getContext failed: ${String(e).slice(0, 120)}`;
+    }
+    let page: Record<string, unknown> = { skipped: "not in webview" };
+    if (current.includes("WEBVIEW")) {
+      try {
+        page = (await this.browser.execute(() => {
+          const w = window as any;
+          return {
+            href: location.href,
+            title: document.title,
+            ready: document.readyState,
+            wdi5: typeof w.wdi5 !== "undefined",
+            bridge: typeof w.bridge !== "undefined",
+            neptune: typeof w.neptune !== "undefined",
+            sap: typeof w.sap !== "undefined",
+            frames: window.frames?.length ?? 0,
+          };
+        })) as Record<string, unknown>;
+      } catch (e) {
+        page = { executeError: String(e).slice(0, 220) };
+      }
+    }
+    console.log(
+      `[iOS-trace] ${label} current=${current} cachedMain=${this.mainAppContext ?? "(none)"} page=${JSON.stringify(page)}`,
+    );
   }
 
   /**
@@ -379,6 +445,13 @@ export class ContextUtil {
   public async switchToContext(contextName: string): Promise<void> {
     try {
       await this.browser.switchContext(contextName);
+      if (
+        this.isIOS() &&
+        contextName.includes("WEBVIEW") &&
+        typeof (this.browser as any).enterIosAppFrame === "function"
+      ) {
+        await (this.browser as any).enterIosAppFrame();
+      }
     } catch (error) {
       throw new ContextError(
         "switchToContext",
@@ -455,6 +528,7 @@ export class ContextUtil {
           const sorted = this.sortWebviewsByIdAscending(webviewNames);
           this.mainAppContext = sorted[0];
           console.log(`[ContextUtil] iOS: Using lowest-numbered webview: ${this.mainAppContext} (from ${sorted.length} webviews)`);
+          console.log(`[iOS-trace] webview order=${JSON.stringify(sorted)} picked=${this.mainAppContext}`);
           return true;
         }
 
@@ -483,6 +557,9 @@ export class ContextUtil {
     );
 
     await this.switchToContext(this.mainAppContext!);
+    if (this.isIOS()) {
+      await this.traceIosState("after switchToMainWebview");
+    }
   }
 
   /**
@@ -839,6 +916,9 @@ export class ContextUtil {
    */
   public async injectUI5(force: boolean = false): Promise<void> {
     try {
+      if (this.isIOS()) {
+        await this.traceIosState(`injectUI5 force=${force} before`);
+      }
       if (!force) {
         // Check if already injected
         const hasWdi5 = await this.browser.execute(() => {
@@ -849,6 +929,9 @@ export class ContextUtil {
           console.log("[ContextUtil] wdi5 already present, skipping injection");
           return; // Already injected
         }
+        if (this.isIOS()) {
+          console.log("[iOS-trace] injectUI5: window.wdi5 is undefined, will inject");
+        }
       }
 
       //@ts-ignore
@@ -856,9 +939,17 @@ export class ContextUtil {
         console.log("[ContextUtil] Injecting UI5/wdi5 bridge");
         //@ts-ignore
         await this.browser.injectUI5();
+        if (this.isIOS()) {
+          await this.traceIosState("injectUI5 after");
+        }
+      } else if (this.isIOS()) {
+        console.log("[iOS-trace] injectUI5: browser.injectUI5 is not a function");
       }
     } catch (error) {
       console.warn(`[ContextUtil] UI5 injection: ${error}`);
+      if (this.isIOS()) {
+        await this.traceIosState("injectUI5 caught");
+      }
     }
   }
 
