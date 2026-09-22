@@ -1,6 +1,6 @@
 {
   "name": "@neptune-software/dxp-e2e-toolbox",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Neptune DXP E2E Toolbox - A robust, version-aware factory-based library for Neptune DXP end-to-end testing",
   "type": "module",
   "main": "dist/cjs/index.js",
@@ -36,7 +36,7 @@
   },
   "homepage": "https://github.com/neptune-software/dxp-e2e-toolbox#readme",
   "peerDependencies": {
-    "expect-webdriverio": "^5",
+    "expect-webdriverio": "^5 || ^6",
     "wdio-ui5-service": "^3",
     "webdriverio": "^9"
   },
