@@ -66,6 +66,19 @@ import { BtpIasLogin, BtpIasLoginOptions } from "../oauth/btp-ias-login.js";
 import { ToolboxFactory } from "../core/toolbox-factory.js";
 import { ContextUtil } from "./context-util.js";
 
+/** Appium iOS with fullContextList returns {id, title, url} instead of a string. */
+function contextId(ctx: unknown): string {
+  if (typeof ctx === "string") return ctx;
+  if (ctx && typeof ctx === "object" && "id" in (ctx as object)) {
+    return String((ctx as { id: string }).id);
+  }
+  return String(ctx);
+}
+
+function contextIds(contexts: unknown[]): string[] {
+  return contexts.map(contextId);
+}
+
 /**
  * Extended browser interface with wdi5 commands
  */
@@ -517,7 +530,7 @@ export class OAuthFlowManager {
   private async captureInitialState(): Promise<void> {
     // Get current contexts - this is the app state before OAuth
     try {
-      this.contextsBeforeLogin = await this.browser.getContexts() as string[];
+      this.contextsBeforeLogin = contextIds(await this.browser.getContexts() as unknown[]);
       console.log(`[OAuthFlowManager] Initial contexts: ${JSON.stringify(this.contextsBeforeLogin)}`);
     } catch (e) {
       console.log(`[OAuthFlowManager] Could not get initial contexts: ${e}`);
@@ -539,7 +552,7 @@ export class OAuthFlowManager {
       console.log(`[OAuthFlowManager] App webview: ${this.appContext}`);
     } else {
       try {
-        this.appContext = await this.browser.getContext();
+        this.appContext = contextId(await this.browser.getContext()) as Context;
         console.log(`[OAuthFlowManager] Current context: ${this.appContext}`);
       } catch (e) {
         console.log(`[OAuthFlowManager] Could not get current context: ${e}`);
@@ -749,7 +762,7 @@ export class OAuthFlowManager {
     };
     
     while (Date.now() - startTime < timeout) {
-      const currentContexts = await this.browser.getContexts() as string[];
+      const currentContexts = contextIds(await this.browser.getContexts() as unknown[]);
       const elapsedSec = Math.round((Date.now() - startTime) / 1000);
       console.log(`[OAuthFlowManager] [${elapsedSec}s] Contexts: ${JSON.stringify(currentContexts)}`);
       
@@ -1061,8 +1074,8 @@ export class OAuthFlowManager {
       console.log(`[OAuthFlowManager] Android: Switching to app context: ${this.appContext}`);
       await this.browser.switchContext(String(this.appContext));
     } else {
-      const contexts = await this.browser.getContexts() as string[];
-      const webview = contexts.map(String).find(c => 
+      const contexts = contextIds(await this.browser.getContexts() as unknown[]);
+      const webview = contexts.find(c =>
         c.includes("WEBVIEW") && !c.toLowerCase().includes("terrace")
       );
       if (webview) {
@@ -1391,7 +1404,7 @@ export class OAuthFlowManager {
     }
     
     // Get fresh context list
-    const contexts = await this.browser.getContexts() as string[];
+    const contexts = contextIds(await this.browser.getContexts() as unknown[]);
     console.log(`[OAuthFlowManager] Contexts after OAuth: ${JSON.stringify(contexts)}`);
     
     // Find the correct app webview
@@ -1455,18 +1468,27 @@ export class OAuthFlowManager {
     // the main webview + a helper webview). A cookie-sync InAppBrowser
     // causes the count to INCREASE beyond the baseline.
     if (this.isIOS()) {
-      const baselineWebviews = contexts.map(String).filter(c => c.includes("WEBVIEW"));
+      const baselineWebviews = contexts.filter(c => c.includes("WEBVIEW"));
       const baselineCount = baselineWebviews.length;
+      const baselineSet = new Set(baselineWebviews);
       console.log(`[OAuthFlowManager] iOS: Monitoring for cookie-sync (baseline: ${baselineCount} webviews)...`);
       let cookieSyncDetected = false;
       
       for (let i = 0; i < 15; i++) {
         await this.browser.pause(1000);
-        const ctxs = (await this.browser.getContexts() as string[]).map(String);
+        const ctxs = contextIds(await this.browser.getContexts() as unknown[]);
         const wvs = ctxs.filter(c => c.includes("WEBVIEW"));
         if (wvs.length > baselineCount) {
           cookieSyncDetected = true;
           console.log(`[OAuthFlowManager] iOS: Cookie-sync InAppBrowser appeared after ${i + 1}s (${wvs.length} vs baseline ${baselineCount})`);
+          break;
+        }
+        // Cookie-sync sometimes replaces a helper webview instead of adding one,
+        // so the count stays the same but the ids change. Stay in NATIVE_APP.
+        const identityChanged = wvs.some((id) => !baselineSet.has(id));
+        if (identityChanged) {
+          cookieSyncDetected = true;
+          console.log(`[OAuthFlowManager] iOS: Cookie-sync webview identity changed after ${i + 1}s (count still ${wvs.length})`);
           break;
         }
       }
@@ -1477,7 +1499,12 @@ export class OAuthFlowManager {
         await this.browser.pause(loadPause * 1000);
         console.log(`[OAuthFlowManager] iOS: Cookie-sync window complete`);
       } else {
-        console.log(`[OAuthFlowManager] iOS: No cookie-sync InAppBrowser detected, proceeding`);
+        // Sync may have finished during the IdP window. A short NATIVE_APP
+        // grace wait still avoids attaching the inspector too early (NAD iOS
+        // Azure/Okta: "No cookie-sync" then login assertion false).
+        const gracePause = 3;
+        console.log(`[OAuthFlowManager] iOS: No cookie-sync InAppBrowser detected, waiting ${gracePause}s in NATIVE_APP before attaching inspector`);
+        await this.browser.pause(gracePause * 1000);
       }
     }
     
