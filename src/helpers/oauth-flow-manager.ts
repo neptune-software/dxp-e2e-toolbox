@@ -1074,8 +1074,8 @@ export class OAuthFlowManager {
       console.log(`[OAuthFlowManager] Android: Switching to app context: ${this.appContext}`);
       await this.browser.switchContext(String(this.appContext));
     } else {
-      const contexts = await this.browser.getContexts() as string[];
-      const webview = contexts.map(String).find(c => 
+      const contexts = contextIds(await this.browser.getContexts() as unknown[]);
+      const webview = contexts.find(c =>
         c.includes("WEBVIEW") && !c.toLowerCase().includes("terrace")
       );
       if (webview) {
