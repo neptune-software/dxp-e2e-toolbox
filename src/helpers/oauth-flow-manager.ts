@@ -632,18 +632,26 @@ export class OAuthFlowManager {
   private async clickLoginButtonIosNative(): Promise<void> {
     console.log(`[OAuthFlowManager] iOS: native logon tap (inspector stays off the app webview)`);
     try { await this.browser.switchContext("NATIVE_APP"); } catch { /* already native */ }
-    await this.browser.pause(300);
-    const tapped = await this.tapIosAny([
-      "logon.logon",
-      "Log On",
-      "Logon",
-    ]);
+    const tapped = await this.waitAndTapIosLogon(15000);
     if (!tapped) {
-      console.log(`[OAuthFlowManager] iOS: logon.logon not in XCUI`);
-    } else {
-      console.log(`[OAuthFlowManager] iOS: tapped ${tapped}`);
+      console.log(`[OAuthFlowManager] iOS: logon.logon never appeared in XCUI`);
     }
     await this.browser.pause(TIMEOUTS.postLoginClick.ios);
+  }
+
+  private async waitAndTapIosLogon(timeoutMs: number): Promise<boolean> {
+    const start = Date.now();
+    let attempt = 0;
+    while (Date.now() - start < timeoutMs) {
+      attempt++;
+      const tapped = await this.tapIosAny(["logon.logon", "Log On", "Logon"]);
+      if (tapped) {
+        console.log(`[OAuthFlowManager] iOS: tapped logon on attempt ${attempt}`);
+        return true;
+      }
+      await this.browser.pause(500);
+    }
+    return false;
   }
   
   /**
@@ -723,22 +731,44 @@ export class OAuthFlowManager {
   }
 
   /** Tap a native control by name/label, any XCUI type. Must already be in NATIVE_APP. */
-  private async tapIosAny(names: string[]): Promise<boolean> {
-    for (const n of names) {
-      for (const attr of ["name", "label"] as const) {
-        try {
-          const el = await this.browser.$(`//*[@${attr}="${n}"]`);
-          if (await el.isExisting().catch(() => false)) {
-            console.log(`[OAuthFlowManager] iOS: tapping native ${attr}="${n}"`);
-            await el.click();
-            return true;
-          }
-        } catch {
-          /* try next */
-        }
+  private async withShortImplicit<T>(ms: number, fn: () => Promise<T>): Promise<T> {
+    let prev = 0;
+    try {
+      const t = await this.browser.getTimeouts();
+      prev = typeof t.implicit === "number" ? t.implicit : 0;
+    } catch {
+      /* keep 0 */
+    }
+    try {
+      await this.browser.setTimeout({ implicit: ms });
+      return await fn();
+    } finally {
+      try {
+        await this.browser.setTimeout({ implicit: prev });
+      } catch {
+        /* ignore */
       }
     }
-    return false;
+  }
+
+  private async tapIosAny(names: string[]): Promise<boolean> {
+    return this.withShortImplicit(400, async () => {
+      for (const n of names) {
+        for (const attr of ["name", "label"] as const) {
+          try {
+            const el = await this.browser.$(`//*[@${attr}="${n}"]`);
+            if (await el.isExisting().catch(() => false)) {
+              console.log(`[OAuthFlowManager] iOS: tapping native ${attr}="${n}"`);
+              await el.click();
+              return true;
+            }
+          } catch {
+            /* try next */
+          }
+        }
+      }
+      return false;
+    });
   }
 
   /** Tap a native iOS system button by name/label. Must already be in NATIVE_APP. */
