@@ -653,7 +653,8 @@ export class OAuthFlowManager {
   
   /**
    * Handle iOS permission dialog ("App wants to use example.com to sign in").
-   * This dialog appears AFTER clicking the login button on iOS.
+   * Do NOT call acceptAlert — WDIO waits the full waitforTimeout per attempt
+   * (~2 min total) and the ASWeb session dies while we sit there.
    */
   private async handleIOSPermissionDialog(): Promise<void> {
     console.log(`[OAuthFlowManager] iOS: Checking for 'wants to sign in' dialog...`);
@@ -664,47 +665,63 @@ export class OAuthFlowManager {
       console.log(`[OAuthFlowManager] iOS: Could not switch to NATIVE_APP: ${e}`);
     }
 
-    const maxAttempts = 8;
+    await this.dumpNativeButtons("permission check");
+    await this.dumpNativePageHints("permission check");
+
+    const maxAttempts = 6;
     let handled = false;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        await this.browser.acceptAlert();
-        console.log(`[OAuthFlowManager] iOS: Permission dialog accepted via alert (attempt ${attempt})`);
+      const tapped = await this.tapIosAny([
+        "Continue",
+        "Allow",
+        "OK",
+        "Open",
+        "Fortfahren",
+        "Erlauben",
+        "Sign In",
+      ]);
+      if (tapped) {
         handled = true;
         break;
-      } catch {
-        const tapped = await this.tapIosSystemButton([
-          "Continue",
-          "Allow",
-          "OK",
-          "Fortfahren",
-          "Erlauben",
-          "Sign In",
-        ]);
-        if (tapped) {
-          handled = true;
-          break;
-        }
-        if (attempt < maxAttempts) {
-          await this.browser.pause(500);
-        }
+      }
+      if (await this.iosAuthInProgress()) {
+        console.log(
+          `[OAuthFlowManager] iOS: auth already in progress (attempt ${attempt}) — skipping dialog wait`,
+        );
+        return;
+      }
+      if (attempt < maxAttempts) {
+        await this.browser.pause(400);
       }
     }
 
     if (!handled) {
       await this.dumpNativeButtons("no permission dialog");
-      const cancelButton = await this.browser.$('//XCUIElementTypeButton[@name="Cancel"]');
-      const safariOpen = await cancelButton.isExisting().catch(() => false);
+      await this.dumpNativePageHints("no permission dialog");
+      const safariOpen = await this.iosSafariSheetOpen();
       console.log(
-        `[OAuthFlowManager] iOS: No dialog found (Safari Cancel visible=${safariOpen}) — continuing`,
+        `[OAuthFlowManager] iOS: No dialog found (sheet open=${safariOpen}) — continuing`,
       );
     }
 
     await this.browser.pause(1500);
   }
 
+  private async iosAuthInProgress(): Promise<boolean> {
+    for (const n of ["logon.cancelAuthentication", "Decline", "logon.AuthenticationProgress"]) {
+      try {
+        const el = await this.browser.$(`//*[@name="${n}" or @label="${n}"]`);
+        if (await el.isExisting().catch(() => false)) return true;
+      } catch {
+        /* next */
+      }
+    }
+    return false;
+  }
+
   private async iosSafariSheetOpen(): Promise<boolean> {
+    if (await this.iosAuthInProgress()) return true;
     try {
       const cancel = await this.browser.$('//XCUIElementTypeButton[@name="Cancel"]');
       return await cancel.isExisting().catch(() => false);
@@ -713,14 +730,14 @@ export class OAuthFlowManager {
     }
   }
 
-  /** Tap a native iOS system button by name/label. Must already be in NATIVE_APP. */
-  private async tapIosSystemButton(names: string[]): Promise<boolean> {
+  /** Tap a native control by name/label, any XCUI type. Must already be in NATIVE_APP. */
+  private async tapIosAny(names: string[]): Promise<boolean> {
     for (const n of names) {
       for (const attr of ["name", "label"] as const) {
         try {
-          const el = await this.browser.$(`//XCUIElementTypeButton[@${attr}="${n}"]`);
+          const el = await this.browser.$(`//*[@${attr}="${n}"]`);
           if (await el.isExisting().catch(() => false)) {
-            console.log(`[OAuthFlowManager] iOS: tapping native button ${attr}="${n}"`);
+            console.log(`[OAuthFlowManager] iOS: tapping native ${attr}="${n}"`);
             await el.click();
             return true;
           }
@@ -730,6 +747,24 @@ export class OAuthFlowManager {
       }
     }
     return false;
+  }
+
+  /** Tap a native iOS system button by name/label. Must already be in NATIVE_APP. */
+  private async tapIosSystemButton(names: string[]): Promise<boolean> {
+    return this.tapIosAny(names);
+  }
+
+  private async dumpNativePageHints(reason: string): Promise<void> {
+    try {
+      const xml = await this.browser.getPageSource();
+      const names = [...xml.matchAll(/\b(?:name|label)="([^"]+)"/g)].map((m) => m[1]);
+      const unique = [...new Set(names)].filter(Boolean).slice(0, 80);
+      console.log(
+        `[OAuthFlowManager] iOS page names (${reason}): ${JSON.stringify(unique)}`,
+      );
+    } catch (e) {
+      console.log(`[OAuthFlowManager] iOS page source dump failed: ${e}`);
+    }
   }
 
   private async dumpNativeButtons(reason: string): Promise<void> {
@@ -920,6 +955,7 @@ export class OAuthFlowManager {
       if (candidates.length === 0) {
         if (elapsedSec === 0 || elapsedSec % 10 === 0) {
           await this.dumpNativeButtons(`no oauth webview at ${elapsedSec}s`);
+          await this.dumpNativePageHints(`no oauth webview at ${elapsedSec}s`);
           if (elapsedSec >= 10 && !(await this.iosSafariSheetOpen())) {
             const retried = await this.tapIosSystemButton([
               "logon.logon",
