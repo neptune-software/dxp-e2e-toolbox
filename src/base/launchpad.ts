@@ -173,11 +173,48 @@ export class BaseLaunchpad extends Page {
   }
 
   /**
+   * iOS: press a UI5 control with a sync execute. wdi5 firePress runs
+   * waitForUI5 inside an async execute; Neptune ios-xhr never goes idle,
+   * so the call hangs 60s and leaves waitAsync locked.
+   */
+  protected async pressByIdSync(controlId: string): Promise<void> {
+    const how = await this.browser.execute(function (id: string) {
+      try {
+        const sap = (window as any).sap;
+        const ctl = sap?.ui?.getCore?.().byId(id);
+        if (ctl && typeof ctl.firePress === "function") {
+          ctl.firePress();
+          return "ui5";
+        }
+      } catch {
+        /* DOM fallback */
+      }
+      const el = document.getElementById(id);
+      if (el) {
+        el.click();
+        return "dom";
+      }
+      return "";
+    }, controlId);
+    if (!how) {
+      throw new Error(`iOS sync press: control not found: ${controlId}`);
+    }
+    console.log(`[Launchpad] iOS sync press ${controlId} via ${how}`);
+  }
+
+  /**
    * Resilient button press that works across platforms.
-   * Tries wdi5's firePress first, falls back to native click if it fails.
-   * This handles iOS issues after app restart where execute returns null.
+   * iOS uses sync firePress/click. Android uses wdi5 firePress then native click.
    */
   protected async pressControl(control: any): Promise<void> {
+    if (this.browser.isIOS) {
+      const cachedId = control?._controlInfo?.id;
+      if (cachedId) {
+        await this.pressByIdSync(cachedId);
+        return;
+      }
+    }
+
     // First, try the standard wdi5 firePress
     try {
       if (typeof control.firePress === "function") {
@@ -581,10 +618,13 @@ export class BaseLaunchpad extends Page {
    */
   public async openUserMenu(): Promise<this> {
     if (!this.userMenuOpened) {
-      const userButton = await this.getControl(this.selectors.buttonUserMenu, true);
-      await this.pressControl(userButton);
+      if (this.browser.isIOS) {
+        await this.pressByIdSync(this.selectors.buttonUserMenu);
+      } else {
+        const userButton = await this.getControl(this.selectors.buttonUserMenu, true);
+        await this.pressControl(userButton);
+      }
       this.userMenuOpened = true;
-      // Wait for menu to open
       await this.browser.pause(300);
     }
     return this;
@@ -595,8 +635,12 @@ export class BaseLaunchpad extends Page {
    */
   public async closeUserMenu(): Promise<this> {
     if (this.userMenuOpened) {
-      const closeButton = await this.getControl(this.selectors.buttonCloseUserMenu, true);
-      await this.pressControl(closeButton);
+      if (this.browser.isIOS) {
+        await this.pressByIdSync(this.selectors.buttonCloseUserMenu);
+      } else {
+        const closeButton = await this.getControl(this.selectors.buttonCloseUserMenu, true);
+        await this.pressControl(closeButton);
+      }
       this.userMenuOpened = false;
     }
     return this;
