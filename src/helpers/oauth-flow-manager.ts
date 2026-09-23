@@ -621,21 +621,25 @@ export class OAuthFlowManager {
       try { await this.browser.switchContext("NATIVE_APP"); } catch { /* already native */ }
       await this.browser.pause(800);
       await this.dumpNativeButtons("after UI5 login click");
-      const dialog = await this.tapIosSystemButton([
-        "Continue",
-        "Allow",
-        "Fortfahren",
-        "Erlauben",
-      ]);
-      if (!dialog) {
-        const nativeLogon = await this.tapIosSystemButton([
-          "logon.logon",
-          "Log On",
-          "Logon",
-          "Login",
+      if (await this.iosSafariSheetOpen()) {
+        console.log(`[OAuthFlowManager] iOS: Safari sheet already open after login click`);
+      } else {
+        const dialog = await this.tapIosSystemButton([
+          "Continue",
+          "Allow",
+          "Fortfahren",
+          "Erlauben",
         ]);
-        if (nativeLogon) {
-          console.log(`[OAuthFlowManager] iOS: native logon tap — UI5 firePress did not start ASWeb`);
+        if (!dialog) {
+          const nativeLogon = await this.tapIosSystemButton([
+            "logon.logon",
+            "Log On",
+            "Logon",
+            "Login",
+          ]);
+          if (nativeLogon) {
+            console.log(`[OAuthFlowManager] iOS: native logon tap — UI5 firePress did not start ASWeb`);
+          }
         }
       }
     }
@@ -698,6 +702,15 @@ export class OAuthFlowManager {
     }
 
     await this.browser.pause(1500);
+  }
+
+  private async iosSafariSheetOpen(): Promise<boolean> {
+    try {
+      const cancel = await this.browser.$('//XCUIElementTypeButton[@name="Cancel"]');
+      return await cancel.isExisting().catch(() => false);
+    } catch {
+      return false;
+    }
   }
 
   /** Tap a native iOS system button by name/label. Must already be in NATIVE_APP. */
@@ -907,6 +920,16 @@ export class OAuthFlowManager {
       if (candidates.length === 0) {
         if (elapsedSec === 0 || elapsedSec % 10 === 0) {
           await this.dumpNativeButtons(`no oauth webview at ${elapsedSec}s`);
+          if (elapsedSec >= 10 && !(await this.iosSafariSheetOpen())) {
+            const retried = await this.tapIosSystemButton([
+              "logon.logon",
+              "Log On",
+              "Logon",
+            ]);
+            if (retried) {
+              console.log(`[OAuthFlowManager] iOS: retry native logon tap at ${elapsedSec}s`);
+            }
+          }
         }
         return null;
       }
