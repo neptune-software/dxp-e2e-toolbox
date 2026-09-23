@@ -708,67 +708,52 @@ export class OAuthFlowManager {
     await this.browser.pause(1500);
   }
 
-  private async iosAuthInProgress(): Promise<boolean> {
-    for (const n of ["logon.cancelAuthentication", "Decline", "logon.AuthenticationProgress"]) {
-      try {
-        const el = await this.browser.$(`//*[@name="${n}" or @label="${n}"]`);
-        if (await el.isExisting().catch(() => false)) return true;
-      } catch {
-        /* next */
-      }
+  private async iosNativeButtonNameLabels(): Promise<string[]> {
+    const buttons = await this.browser.$$("XCUIElementTypeButton");
+    const count = await buttons.length;
+    const names: string[] = [];
+    const limit = Math.min(count, 40);
+    for (let i = 0; i < limit; i++) {
+      const name = await buttons[i].getAttribute("name").catch(() => "");
+      const label = await buttons[i].getAttribute("label").catch(() => "");
+      names.push(`${name}|${label}`);
     }
-    return false;
+    return names;
+  }
+
+  private async iosAuthInProgress(): Promise<boolean> {
+    const names = await this.iosNativeButtonNameLabels();
+    return names.some((n) =>
+      /cancelAuthentication|Decline|AuthenticationProgress/i.test(n),
+    );
   }
 
   private async iosSafariSheetOpen(): Promise<boolean> {
-    if (await this.iosAuthInProgress()) return true;
-    try {
-      const cancel = await this.browser.$('//XCUIElementTypeButton[@name="Cancel"]');
-      return await cancel.isExisting().catch(() => false);
-    } catch {
-      return false;
-    }
-  }
-
-  /** Tap a native control by name/label, any XCUI type. Must already be in NATIVE_APP. */
-  private async withShortImplicit<T>(ms: number, fn: () => Promise<T>): Promise<T> {
-    let prev = 0;
-    try {
-      const t = await this.browser.getTimeouts();
-      prev = typeof t.implicit === "number" ? t.implicit : 0;
-    } catch {
-      /* keep 0 */
-    }
-    try {
-      await this.browser.setTimeout({ implicit: ms });
-      return await fn();
-    } finally {
-      try {
-        await this.browser.setTimeout({ implicit: prev });
-      } catch {
-        /* ignore */
-      }
-    }
+    const names = await this.iosNativeButtonNameLabels();
+    return names.some((n) =>
+      /cancelAuthentication|Decline|AuthenticationProgress|^Cancel\|/i.test(n),
+    );
   }
 
   private async tapIosAny(names: string[]): Promise<boolean> {
-    return this.withShortImplicit(400, async () => {
-      for (const n of names) {
-        for (const attr of ["name", "label"] as const) {
-          try {
-            const el = await this.browser.$(`//*[@${attr}="${n}"]`);
-            if (await el.isExisting().catch(() => false)) {
-              console.log(`[OAuthFlowManager] iOS: tapping native ${attr}="${n}"`);
-              await el.click();
-              return true;
-            }
-          } catch {
-            /* try next */
-          }
+    const want = new Set(names);
+    try {
+      const buttons = await this.browser.$$("XCUIElementTypeButton");
+      const count = await buttons.length;
+      const limit = Math.min(count, 40);
+      for (let i = 0; i < limit; i++) {
+        const name = (await buttons[i].getAttribute("name").catch(() => "")) || "";
+        const label = (await buttons[i].getAttribute("label").catch(() => "")) || "";
+        if (want.has(name) || want.has(label)) {
+          console.log(`[OAuthFlowManager] iOS: tapping native name="${name}" label="${label}"`);
+          await buttons[i].click();
+          return true;
         }
       }
-      return false;
-    });
+    } catch (e) {
+      console.log(`[OAuthFlowManager] iOS tapIosAny failed: ${e}`);
+    }
+    return false;
   }
 
   /** Tap a native iOS system button by name/label. Must already be in NATIVE_APP. */

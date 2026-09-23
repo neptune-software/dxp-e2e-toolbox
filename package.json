@@ -1,6 +1,6 @@
 {
   "name": "@neptune-software/dxp-e2e-toolbox",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "description": "Neptune DXP E2E Toolbox - A robust, version-aware factory-based library for Neptune DXP end-to-end testing",
   "type": "module",
   "main": "dist/cjs/index.js",
