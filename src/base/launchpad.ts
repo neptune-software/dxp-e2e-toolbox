@@ -202,6 +202,60 @@ export class BaseLaunchpad extends Page {
     console.log(`[Launchpad] iOS sync press ${controlId} via ${how}`);
   }
 
+  /** iOS: set an Input value without wdi5 enterText / waitForUI5. */
+  protected async setByIdSync(controlId: string, value: string): Promise<void> {
+    const how = await this.browser.execute(
+      function (id: string, val: string) {
+        try {
+          const sap = (window as any).sap;
+          const ctl = sap?.ui?.getCore?.().byId(id);
+          if (ctl && typeof ctl.setValue === "function") {
+            ctl.setValue(val);
+            if (typeof ctl.fireChange === "function") {
+              ctl.fireChange({ value: val });
+            }
+            return "ui5";
+          }
+        } catch {
+          /* DOM fallback */
+        }
+        const el = document.getElementById(id) as HTMLInputElement | null;
+        if (el) {
+          el.value = val;
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          return "dom";
+        }
+        return "";
+      },
+      controlId,
+      value,
+    );
+    if (!how) {
+      throw new Error(`iOS sync setValue: control not found: ${controlId}`);
+    }
+    console.log(`[Launchpad] iOS sync setValue ${controlId} via ${how}`);
+  }
+
+  /** iOS: read control text without wdi5 getText / waitForUI5. */
+  protected async getTextByIdSync(controlId: string): Promise<string | null> {
+    const text = await this.browser.execute(function (id: string) {
+      try {
+        const sap = (window as any).sap;
+        const ctl = sap?.ui?.getCore?.().byId(id);
+        if (ctl && typeof ctl.getText === "function") {
+          return ctl.getText();
+        }
+      } catch {
+        /* DOM fallback */
+      }
+      const el = document.getElementById(id);
+      return el?.textContent ?? "";
+    }, controlId);
+    const s = text ? String(text).trim() : "";
+    return s || null;
+  }
+
   /**
    * Resilient button press that works across platforms.
    * iOS uses sync firePress/click. Android uses wdi5 firePress then native click.
@@ -349,17 +403,24 @@ export class BaseLaunchpad extends Page {
     screen: AppCacheNavScreens,
     timeout = DEFAULT_TIMEOUTS.medium
   ): Promise<this> {
-    await this.browser.waitUntil(
-      async () => {
-        const current = await this.getCurrentScreen();
-        return current === screen;
-      },
-      {
-        timeout,
-        interval: 200,
-        timeoutMsg: `Expected screen "${screen}" but it did not appear`,
-      }
-    );
+    try {
+      await this.browser.waitUntil(
+        async () => {
+          const current = await this.getCurrentScreen();
+          return current === screen;
+        },
+        {
+          timeout,
+          interval: 200,
+          timeoutMsg: `Expected screen "${screen}" but it did not appear`,
+        }
+      );
+    } catch {
+      const current = await this.getCurrentScreen().catch(() => undefined);
+      throw new Error(
+        `Expected screen "${screen}" but it did not appear (current: ${current ?? "undefined"})`,
+      );
+    }
     return this;
   }
 
@@ -390,19 +451,22 @@ export class BaseLaunchpad extends Page {
    * ```
    */
   public async login(username: string, password: string): Promise<this> {
-    // Verify we're on the login screen
     await this.assertScreen(AppCacheNavScreens.AppCache_boxLogon);
 
-    // Enter credentials
+    if (this.browser.isIOS) {
+      await this.setByIdSync(this.selectors.inputUsername, username);
+      await this.setByIdSync(this.selectors.inputPassword, password);
+      await this.clickLogin();
+      return this;
+    }
+
     const usernameInput = await this.getInputUsername(true) as { enterText: (text: string) => Promise<void> };
     await usernameInput.enterText(username);
 
     const passwordInput = await this.getInputPassword(true) as { enterText: (text: string) => Promise<void> };
     await passwordInput.enterText(password);
 
-    // Click login
     await this.clickLogin();
-
     return this;
   }
 
@@ -410,8 +474,12 @@ export class BaseLaunchpad extends Page {
    * Click the login button.
    */
   public async clickLogin(): Promise<this> {
+    if (this.browser.isIOS) {
+      await this.pressByIdSync(this.selectors.buttonLogin);
+      return this;
+    }
     const loginButton = await this.getButtonLogin(true);
-    await this.browser.pause(500); // Brief pause for UI stability
+    await this.browser.pause(500);
     await this.pressControl(loginButton);
     return this;
   }
@@ -420,6 +488,21 @@ export class BaseLaunchpad extends Page {
    * Get the login error message text.
    */
   public async getLoginErrorMessage(): Promise<string | null> {
+    if (this.browser.isIOS) {
+      for (let i = 0; i < 8; i++) {
+        const text = await this.getTextByIdSync(this.selectors.messageLogon);
+        if (text) return text;
+        const visible = await this.browser.execute(function () {
+          const body = document.body?.innerText || "";
+          return body.slice(0, 500);
+        }).catch(() => "");
+        if (i === 3) {
+          console.log(`[Launchpad] iOS logon visible text while waiting for error: ${visible}`);
+        }
+        await this.browser.pause(500);
+      }
+      return await this.getTextByIdSync(this.selectors.messageLogon);
+    }
     try {
       const messageControl = await this.getMessageLogon(true) as { getText: () => Promise<string> };
       return await messageControl.getText();
@@ -442,17 +525,22 @@ export class BaseLaunchpad extends Page {
    * ```
    */
   public async setPincode(pincode: string, confirmPincode?: string): Promise<this> {
-    // Wait for pincode screen
     await this.waitForScreen(AppCacheNavScreens.AppCache_boxPasscode);
 
-    // Enter pincode in both fields
+    const confirm = confirmPincode ?? pincode;
+    if (this.browser.isIOS) {
+      await this.setByIdSync(this.selectors.inputPasscode1, pincode);
+      await this.setByIdSync(this.selectors.inputPasscode2, confirm);
+      await this.pressByIdSync(this.selectors.buttonSetPasscode);
+      return this;
+    }
+
     const passcode1 = await this.getControl(this.selectors.inputPasscode1, true) as { enterText: (text: string) => Promise<void> };
     await passcode1.enterText(pincode);
 
     const passcode2 = await this.getControl(this.selectors.inputPasscode2, true) as { enterText: (text: string) => Promise<void> };
-    await passcode2.enterText(confirmPincode ?? pincode);
+    await passcode2.enterText(confirm);
 
-    // Click set passcode button
     const setButton = await this.getControl(this.selectors.buttonSetPasscode, true);
     await this.pressControl(setButton);
 
@@ -469,15 +557,17 @@ export class BaseLaunchpad extends Page {
    * ```
    */
   public async enterPincode(pincode: string): Promise<this> {
-    // Wait for pincode entry screen
     await this.waitForScreen(AppCacheNavScreens.AppCache_boxPasscodeEntry);
 
-    // Press each digit
     const digits = Array.from(String(pincode), Number);
     for (const digit of digits) {
-      const button = await this.getNumpadButton(digit, true);
-      await this.pressControl(button);
-      await this.browser.pause(50); // Brief delay between digits
+      if (this.browser.isIOS) {
+        await this.pressByIdSync(`${this.selectors.numpadButtonPrefix}${digit}`);
+      } else {
+        const button = await this.getNumpadButton(digit, true);
+        await this.pressControl(button);
+      }
+      await this.browser.pause(50);
     }
 
     return this;
