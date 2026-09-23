@@ -425,10 +425,8 @@ export class OAuthFlowManager {
         console.log(`[OAuthFlowManager] No launchpadName provided - assuming OAuth already triggered`);
       }
       
-      // Step 3: Handle iOS permission dialog (appears after clicking login)
-      if (this.isIOS() && browserMode === "native") {
-        await this.handleIOSPermissionDialog();
-      }
+      // Step 3: iOS Continue/Allow is tapped from the wait loop.
+      // A XCUI dump here snapshots the WKWebView and kills the OAuth XHR.
       
       // Step 4: Switch to OAuth context
       const loginContext = await this.switchToOAuthContext(timeout, browserMode);
@@ -503,11 +501,6 @@ export class OAuthFlowManager {
       await this.clickLoginButton(launchpadName);
     }
     
-    // Handle iOS permission dialog
-    if (this.isIOS() && browserMode === "native") {
-      await this.handleIOSPermissionDialog();
-    }
-    
     return await this.switchToOAuthContext(timeout, browserMode);
   }
   
@@ -528,9 +521,16 @@ export class OAuthFlowManager {
    * Just saves the current contexts so we can identify new ones after OAuth opens.
    */
   private async captureInitialState(): Promise<void> {
-    // Get current contexts - this is the app state before OAuth
     try {
-      this.contextsBeforeLogin = contextIds(await this.browser.getContexts() as unknown[]);
+      if (this.isIOS()) {
+        const detailed = await this.browser.execute("mobile: getContexts") as any[];
+        this.contextsBeforeLogin = Array.isArray(detailed)
+          ? detailed.map((c) => contextId(c?.id ?? c))
+          : [];
+        try { await this.browser.switchContext("NATIVE_APP"); } catch { /* already native */ }
+      } else {
+        this.contextsBeforeLogin = contextIds(await this.browser.getContexts() as unknown[]);
+      }
       console.log(`[OAuthFlowManager] Initial contexts: ${JSON.stringify(this.contextsBeforeLogin)}`);
     } catch (e) {
       console.log(`[OAuthFlowManager] Could not get initial contexts: ${e}`);
@@ -573,7 +573,12 @@ export class OAuthFlowManager {
    */
   private async clickLoginButton(launchpadName: string): Promise<void> {
     console.log(`[OAuthFlowManager] Clicking login button for: ${launchpadName}`);
-    
+
+    if (this.isIOS()) {
+      await this.clickLoginButtonIosNative();
+      return;
+    }
+
     // Ensure we're in the app webview and wdi5 is available
     // This is critical after app restart or navigation
     if (this.appContext) {
@@ -617,38 +622,28 @@ export class OAuthFlowManager {
     await launchpad.clickLogin();
     console.log(`[OAuthFlowManager] Login button clicked - OAuth should open now`);
 
-    if (this.isIOS()) {
-      try { await this.browser.switchContext("NATIVE_APP"); } catch { /* already native */ }
-      await this.browser.pause(800);
-      await this.dumpNativeButtons("after UI5 login click");
-      if (await this.iosSafariSheetOpen()) {
-        console.log(`[OAuthFlowManager] iOS: Safari sheet already open after login click`);
-      } else {
-        const dialog = await this.tapIosSystemButton([
-          "Continue",
-          "Allow",
-          "Fortfahren",
-          "Erlauben",
-        ]);
-        if (!dialog) {
-          const nativeLogon = await this.tapIosSystemButton([
-            "logon.logon",
-            "Log On",
-            "Logon",
-            "Login",
-          ]);
-          if (nativeLogon) {
-            console.log(`[OAuthFlowManager] iOS: native logon tap — UI5 firePress did not start ASWeb`);
-          }
-        }
-      }
-    }
+    await this.browser.pause(TIMEOUTS.postLoginClick.android);
+  }
 
-    // Wait for OAuth to start opening
-    const postClickWait = this.isIOS() 
-      ? TIMEOUTS.postLoginClick.ios 
-      : TIMEOUTS.postLoginClick.android;
-    await this.browser.pause(postClickWait);
+  /**
+   * iOS: tap logon via XCUI only. switchContext/execute on the app WKWebView
+   * attaches Safari Remote Inspector and blocks the OAuth XHR (No Connection).
+   */
+  private async clickLoginButtonIosNative(): Promise<void> {
+    console.log(`[OAuthFlowManager] iOS: native logon tap (inspector stays off the app webview)`);
+    try { await this.browser.switchContext("NATIVE_APP"); } catch { /* already native */ }
+    await this.browser.pause(300);
+    const tapped = await this.tapIosAny([
+      "logon.logon",
+      "Log On",
+      "Logon",
+    ]);
+    if (!tapped) {
+      console.log(`[OAuthFlowManager] iOS: logon.logon not in XCUI`);
+    } else {
+      console.log(`[OAuthFlowManager] iOS: tapped ${tapped}`);
+    }
+    await this.browser.pause(TIMEOUTS.postLoginClick.ios);
   }
   
   /**
@@ -665,10 +660,7 @@ export class OAuthFlowManager {
       console.log(`[OAuthFlowManager] iOS: Could not switch to NATIVE_APP: ${e}`);
     }
 
-    await this.dumpNativeButtons("permission check");
-    await this.dumpNativePageHints("permission check");
-
-    const maxAttempts = 6;
+    const maxAttempts = 4;
     let handled = false;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -872,26 +864,29 @@ export class OAuthFlowManager {
     };
     
     while (Date.now() - startTime < timeout) {
-      const currentContexts = contextIds(await this.browser.getContexts() as unknown[]);
       const elapsedSec = Math.round((Date.now() - startTime) / 1000);
-      console.log(`[OAuthFlowManager] [${elapsedSec}s] Contexts: ${JSON.stringify(currentContexts)}`);
-      
+
       if (browserMode === "native" && this.isIOS()) {
-        // iOS Native (ASWebAuthenticationSession): Safari runs in a separate
-        // process with its own PID. Use mobile: getContexts to find the OAuth
-        // page without attaching the inspector, then switch to the best
-        // candidate (highest page number = most likely the visible page).
+        // Do not call getContexts() — that attaches Safari Remote Inspector
+        // and kills the in-flight OAuth XHR (No Connection after ~10s).
         const safariCtx = await this.findAndSwitchToSafariOAuth(elapsedSec);
         if (safariCtx) return safariCtx;
-        
-        // Fallback: native element detection + manual webview switching
-        const context = await this.findIOSNativeBrowserContext(currentContexts, getWebviewId);
-        if (context) return context;
-      } else {
-        // Android Native or InAppBrowser: Check webview contexts directly
-        const context = await this.findWebviewContext(currentContexts, getWebviewId, browserMode);
-        if (context) return context;
+        if (elapsedSec >= 20) {
+          const detailed = await this.browser.execute("mobile: getContexts") as any[];
+          const ids = (Array.isArray(detailed) ? detailed : []).map((c) =>
+            contextId(c?.id ?? c),
+          );
+          const context = await this.findIOSNativeBrowserContext(ids, getWebviewId);
+          if (context) return context;
+        }
+        await this.browser.pause(TIMEOUTS.pollInterval);
+        continue;
       }
+
+      const currentContexts = contextIds(await this.browser.getContexts() as unknown[]);
+      console.log(`[OAuthFlowManager] [${elapsedSec}s] Contexts: ${JSON.stringify(currentContexts)}`);
+      const context = await this.findWebviewContext(currentContexts, getWebviewId, browserMode);
+      if (context) return context;
       
       await this.browser.pause(TIMEOUTS.pollInterval);
     }
@@ -953,10 +948,12 @@ export class OAuthFlowManager {
 
       const candidates = safariOAuthPages.length > 0 ? safariOAuthPages : samePidHttpPages;
       if (candidates.length === 0) {
-        if (elapsedSec === 0 || elapsedSec % 10 === 0) {
-          await this.dumpNativeButtons(`no oauth webview at ${elapsedSec}s`);
-          await this.dumpNativePageHints(`no oauth webview at ${elapsedSec}s`);
-          if (elapsedSec >= 10 && !(await this.iosSafariSheetOpen())) {
+        if (elapsedSec > 0 && elapsedSec % 5 === 0) {
+          await this.tapIosAny(["Continue", "Allow", "Fortfahren", "Erlauben"]);
+        }
+        if (elapsedSec > 0 && elapsedSec % 10 === 0) {
+          await this.handleIOSPermissionDialog();
+          if (!(await this.iosSafariSheetOpen())) {
             const retried = await this.tapIosSystemButton([
               "logon.logon",
               "Log On",
