@@ -179,12 +179,19 @@ export class BaseLaunchpad extends Page {
    */
   protected async pressByIdSync(controlId: string): Promise<void> {
     const how = await this.browser.execute(function (id: string) {
+      // Cordova / ASWeb plugins bind to a real DOM click, not UI5 firePress.
+      let ui5 = false;
       try {
         const sap = (window as any).sap;
         const ctl = sap?.ui?.getCore?.().byId(id);
         if (ctl && typeof ctl.firePress === "function") {
           ctl.firePress();
-          return "ui5";
+          ui5 = true;
+          const ref = typeof ctl.getDomRef === "function" ? ctl.getDomRef() : null;
+          if (ref && typeof ref.click === "function") {
+            ref.click();
+            return "ui5+dom";
+          }
         }
       } catch {
         /* DOM fallback */
@@ -192,9 +199,9 @@ export class BaseLaunchpad extends Page {
       const el = document.getElementById(id);
       if (el) {
         el.click();
-        return "dom";
+        return ui5 ? "ui5+dom" : "dom";
       }
-      return "";
+      return ui5 ? "ui5" : "";
     }, controlId);
     if (!how) {
       throw new Error(`iOS sync press: control not found: ${controlId}`);
