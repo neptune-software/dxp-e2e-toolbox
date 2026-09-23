@@ -616,7 +616,30 @@ export class OAuthFlowManager {
     const launchpad = await ToolboxFactory.createLaunchpad({ launchpadName });
     await launchpad.clickLogin();
     console.log(`[OAuthFlowManager] Login button clicked - OAuth should open now`);
-    
+
+    if (this.isIOS()) {
+      try { await this.browser.switchContext("NATIVE_APP"); } catch { /* already native */ }
+      await this.browser.pause(800);
+      await this.dumpNativeButtons("after UI5 login click");
+      const dialog = await this.tapIosSystemButton([
+        "Continue",
+        "Allow",
+        "Fortfahren",
+        "Erlauben",
+      ]);
+      if (!dialog) {
+        const nativeLogon = await this.tapIosSystemButton([
+          "logon.logon",
+          "Log On",
+          "Logon",
+          "Login",
+        ]);
+        if (nativeLogon) {
+          console.log(`[OAuthFlowManager] iOS: native logon tap — UI5 firePress did not start ASWeb`);
+        }
+      }
+    }
+
     // Wait for OAuth to start opening
     const postClickWait = this.isIOS() 
       ? TIMEOUTS.postLoginClick.ios 
