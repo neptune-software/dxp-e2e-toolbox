@@ -630,50 +630,89 @@ export class OAuthFlowManager {
    */
   private async handleIOSPermissionDialog(): Promise<void> {
     console.log(`[OAuthFlowManager] iOS: Checking for 'wants to sign in' dialog...`);
-    
-    // Switch to native context to detect and handle native dialogs
+
     try {
       await this.browser.switchContext("NATIVE_APP");
     } catch (e) {
       console.log(`[OAuthFlowManager] iOS: Could not switch to NATIVE_APP: ${e}`);
     }
-    
-    // Try to accept the dialog multiple times (it may take a moment to appear)
-    const maxAttempts = 5;
-    let dialogAccepted = false;
-    
+
+    const maxAttempts = 8;
+    let handled = false;
+
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         await this.browser.acceptAlert();
-        console.log(`[OAuthFlowManager] iOS: Permission dialog accepted (attempt ${attempt})`);
-        dialogAccepted = true;
+        console.log(`[OAuthFlowManager] iOS: Permission dialog accepted via alert (attempt ${attempt})`);
+        handled = true;
         break;
       } catch {
-        // Dialog not found yet, wait and retry
+        const tapped = await this.tapIosSystemButton([
+          "Continue",
+          "Allow",
+          "OK",
+          "Fortfahren",
+          "Erlauben",
+          "Sign In",
+        ]);
+        if (tapped) {
+          handled = true;
+          break;
+        }
         if (attempt < maxAttempts) {
           await this.browser.pause(500);
         }
       }
     }
-    
-    if (!dialogAccepted) {
-      // No dialog found - check if Safari opened anyway (some iOS versions don't show dialog)
-      console.log(`[OAuthFlowManager] iOS: No dialog found - checking if Safari opened...`);
-      try {
-        const cancelButton = await this.browser.$('//XCUIElementTypeButton[@name="Cancel"]');
-        const safariOpen = await cancelButton.isExisting().catch(() => false);
-        if (safariOpen) {
-          console.log(`[OAuthFlowManager] iOS: Safari is open (no dialog was needed)`);
-        } else {
-          console.log(`[OAuthFlowManager] iOS: Safari not detected yet - continuing anyway`);
+
+    if (!handled) {
+      await this.dumpNativeButtons("no permission dialog");
+      const cancelButton = await this.browser.$('//XCUIElementTypeButton[@name="Cancel"]');
+      const safariOpen = await cancelButton.isExisting().catch(() => false);
+      console.log(
+        `[OAuthFlowManager] iOS: No dialog found (Safari Cancel visible=${safariOpen}) — continuing`,
+      );
+    }
+
+    await this.browser.pause(1500);
+  }
+
+  /** Tap a native iOS system button by name/label. Must already be in NATIVE_APP. */
+  private async tapIosSystemButton(names: string[]): Promise<boolean> {
+    for (const n of names) {
+      for (const attr of ["name", "label"] as const) {
+        try {
+          const el = await this.browser.$(`//XCUIElementTypeButton[@${attr}="${n}"]`);
+          if (await el.isExisting().catch(() => false)) {
+            console.log(`[OAuthFlowManager] iOS: tapping native button ${attr}="${n}"`);
+            await el.click();
+            return true;
+          }
+        } catch {
+          /* try next */
         }
-      } catch {
-        console.log(`[OAuthFlowManager] iOS: Could not check for Safari`);
       }
     }
-    
-    // Give Safari time to fully open
-    await this.browser.pause(1500);
+    return false;
+  }
+
+  private async dumpNativeButtons(reason: string): Promise<void> {
+    try {
+      const buttons = await this.browser.$$("XCUIElementTypeButton");
+      const count = await buttons.length;
+      const names: string[] = [];
+      const limit = Math.min(count, 40);
+      for (let i = 0; i < limit; i++) {
+        const name = await buttons[i].getAttribute("name").catch(() => "");
+        const label = await buttons[i].getAttribute("label").catch(() => "");
+        names.push(`${name}|${label}`);
+      }
+      console.log(
+        `[OAuthFlowManager] iOS native buttons (${reason}, ${count}): ${JSON.stringify(names)}`,
+      );
+    } catch (e) {
+      console.log(`[OAuthFlowManager] iOS native button dump failed: ${e}`);
+    }
   }
   
   /**
@@ -814,36 +853,51 @@ export class OAuthFlowManager {
         : null;
 
       const safariOAuthPages: string[] = [];
+      const samePidHttpPages: string[] = [];
 
       for (const ctx of detailed) {
         if (!ctx?.id || !String(ctx.id).includes("WEBVIEW")) continue;
 
         const ctxId = String(ctx.id);
-
-        // Skip the app's own webviews (same process prefix)
-        if (appProcessPrefix && ctxId.startsWith(appProcessPrefix + ".")) continue;
-
         const url = ctx.url || "(no url)";
         const title = ctx.title || "";
-        console.log(`[OAuthFlowManager] [${elapsedSec}s] Safari ${ctxId}: ${url} (${title})`);
+        const samePid = !!(appProcessPrefix && ctxId.startsWith(appProcessPrefix + "."));
+        console.log(
+          `[OAuthFlowManager] [${elapsedSec}s] webview ${ctxId} samePid=${samePid} ${url} (${title})`,
+        );
+
+        if (ctxId === String(this.appContext)) continue;
+
+        if (samePid) {
+          if (ctx.url && /^https?:\/\//i.test(ctx.url) && ctx.url !== "about:blank") {
+            samePidHttpPages.push(ctxId);
+          }
+          continue;
+        }
 
         if (ctx.url && await this.isOAuthUrl(ctx.url)) {
           safariOAuthPages.push(ctxId);
         }
       }
 
-      if (safariOAuthPages.length === 0) return null;
+      const candidates = safariOAuthPages.length > 0 ? safariOAuthPages : samePidHttpPages;
+      if (candidates.length === 0) {
+        if (elapsedSec === 0 || elapsedSec % 10 === 0) {
+          await this.dumpNativeButtons(`no oauth webview at ${elapsedSec}s`);
+        }
+        return null;
+      }
 
       // Try highest page number first — the main content page in Safari is
       // typically the highest-numbered one; lower numbers may be service
       // workers or background pages that can't be switched to.
-      safariOAuthPages.sort((a, b) => {
+      candidates.sort((a, b) => {
         const aPage = parseInt(a.split('.').pop() || '0');
         const bPage = parseInt(b.split('.').pop() || '0');
         return bPage - aPage;
       });
 
-      console.log(`[OAuthFlowManager] iOS Safari: OAuth page(s): ${JSON.stringify(safariOAuthPages)}`);
+      console.log(`[OAuthFlowManager] iOS Safari: OAuth page(s): ${JSON.stringify(candidates)}`);
 
       // Give Safari's Remote Inspector time to set up its debugging endpoint.
       // mobile: getContexts finds pages very fast via the listing protocol,
@@ -853,7 +907,7 @@ export class OAuthFlowManager {
         await this.browser.pause(3000);
       }
 
-      for (const ctxId of safariOAuthPages) {
+      for (const ctxId of candidates) {
         try {
           console.log(`[OAuthFlowManager] iOS Safari: Switching to ${ctxId}...`);
           await this.browser.switchContext(ctxId);
