@@ -698,7 +698,6 @@ export class OAuthFlowManager {
 
     if (!handled) {
       await this.dumpNativeButtons("no permission dialog");
-      await this.dumpNativePageHints("no permission dialog");
       const safariOpen = await this.iosSafariSheetOpen();
       console.log(
         `[OAuthFlowManager] iOS: No dialog found (sheet open=${safariOpen}) — continuing`,
@@ -746,7 +745,20 @@ export class OAuthFlowManager {
         const label = (await buttons[i].getAttribute("label").catch(() => "")) || "";
         if (want.has(name) || want.has(label)) {
           console.log(`[OAuthFlowManager] iOS: tapping native name="${name}" label="${label}"`);
-          await buttons[i].click();
+          try {
+            const loc = await buttons[i].getLocation();
+            const size = await buttons[i].getSize();
+            const x = Math.round(loc.x + size.width / 2);
+            const y = Math.round(loc.y + size.height / 2);
+            await this.browser.execute("mobile: tap", { x, y });
+          } catch (e) {
+            const msg = String(e);
+            if (msg.includes("stale") || msg.includes("no such element")) {
+              console.log(`[OAuthFlowManager] iOS: tap stale on ${name} — treating as dismissed`);
+              return true;
+            }
+            throw e;
+          }
           return true;
         }
       }
@@ -964,7 +976,16 @@ export class OAuthFlowManager {
       const candidates = safariOAuthPages.length > 0 ? safariOAuthPages : samePidHttpPages;
       if (candidates.length === 0) {
         if (elapsedSec > 0 && elapsedSec % 5 === 0) {
-          await this.tapIosAny(["Continue", "Allow", "Fortfahren", "Erlauben"]);
+          const tappedContinue = await this.tapIosAny([
+            "Continue",
+            "Allow",
+            "Fortfahren",
+            "Erlauben",
+          ]);
+          if (tappedContinue) {
+            await this.browser.pause(1500);
+            return null;
+          }
         }
         if (elapsedSec > 0 && elapsedSec % 10 === 0) {
           await this.handleIOSPermissionDialog();
@@ -1037,8 +1058,10 @@ export class OAuthFlowManager {
     // Check if Safari is open via native element detection
     try {
       await this.browser.switchContext("NATIVE_APP");
-      const cancelButton = await this.browser.$('//XCUIElementTypeButton[@name="Cancel"]');
-      const isSafariOpen = await cancelButton.isExisting().catch(() => false);
+      const names = await this.iosNativeButtonNameLabels();
+      const isSafariOpen = names.some((n) =>
+        /cancelAuthentication|^Cancel\|/i.test(n),
+      );
       
       if (!isSafariOpen) {
         console.log(`[OAuthFlowManager] iOS: Safari not detected (no Cancel button)`);
