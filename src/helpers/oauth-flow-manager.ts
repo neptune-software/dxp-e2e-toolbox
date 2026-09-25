@@ -720,18 +720,23 @@ export class OAuthFlowManager {
     return names;
   }
 
+  /** True when name or label equals `want`. `logon.cancelAuthentication` is not Cancel. */
+  private iosHasExactButton(names: string[], want: string): boolean {
+    const target = want.toLowerCase();
+    return names.some((n) => {
+      const [name, label] = n.split("|");
+      return name.toLowerCase() === target || label.toLowerCase() === target;
+    });
+  }
+
   private async iosAuthInProgress(): Promise<boolean> {
     const names = await this.iosNativeButtonNameLabels();
-    return names.some((n) =>
-      /cancelAuthentication|Decline|AuthenticationProgress/i.test(n),
-    );
+    return this.iosHasExactButton(names, "Cancel");
   }
 
   private async iosSafariSheetOpen(): Promise<boolean> {
     const names = await this.iosNativeButtonNameLabels();
-    return names.some((n) =>
-      /cancelAuthentication|Decline|AuthenticationProgress|^Cancel\|/i.test(n),
-    );
+    return this.iosHasExactButton(names, "Cancel");
   }
 
   private async tapIosAny(names: string[]): Promise<boolean> {
@@ -1046,9 +1051,7 @@ export class OAuthFlowManager {
     try {
       await this.browser.switchContext("NATIVE_APP");
       const names = await this.iosNativeButtonNameLabels();
-      const isSafariOpen = names.some((n) =>
-        /cancelAuthentication|^Cancel\|/i.test(n),
-      );
+      const isSafariOpen = this.iosHasExactButton(names, "Cancel");
       
       if (!isSafariOpen) {
         console.log(`[OAuthFlowManager] iOS: Safari not detected (no Cancel button)`);
@@ -1102,27 +1105,7 @@ export class OAuthFlowManager {
       if (result) return result;
     }
     
-    // Safari is open but no accessible OAuth webview found
-    // This can happen with ASWebAuthenticationSession - Safari is visible but not switchable
     console.log(`[OAuthFlowManager] iOS: Safari open but no accessible OAuth webview`);
-    console.log(`[OAuthFlowManager] iOS: Checking if OAuth auto-completed...`);
-    
-    await this.browser.pause(3000);
-    
-    try {
-      await this.browser.switchContext("NATIVE_APP");
-      const cancelButton = await this.browser.$('//XCUIElementTypeButton[@name="Cancel"]');
-      const stillOpen = await cancelButton.isExisting().catch(() => false);
-      
-      if (!stillOpen) {
-        console.log(`[OAuthFlowManager] iOS: Safari closed - OAuth auto-completed!`);
-        return "OAUTH_AUTO_COMPLETED" as unknown as Context;
-      }
-    } catch {
-      // Ignore
-    }
-    
-    console.log(`[OAuthFlowManager] iOS: Waiting for Safari OAuth to become accessible...`);
     return null;
   }
   

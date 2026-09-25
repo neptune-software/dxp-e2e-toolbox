@@ -106,57 +106,56 @@ export class AzureLogin extends BaseOAuthProvider {
 
     // Click sign in with retry
     await this.clickSignInWithRetry();
+    await this.browser.pause(1000);
 
-    this.browser.pause(1000);
-
-    // OPTIMIZATION: Check if login has already auto-completed (OAuth page closed)
-    // This happens when Azure doesn't show "Stay signed in" and immediately redirects
-    // Checking early avoids 20+ second timeouts trying to find elements on a closed page
-    const stillOnAzure = await this.isOnAzureLoginPage();
-    
-    if (!stillOnAzure) {
+    if (!(await this.isOnAzureLoginPage())) {
       console.log("[AzureLogin] Login auto-completed (already redirected back to app)");
       console.log("[AzureLogin] Login flow completed");
       return;
     }
 
-    // Wait for "Stay signed in?" prompt (only if still on Azure)
-    console.log("[AzureLogin] Still on Azure - checking for 'Stay signed in' prompt...");
+    // #idSIButton9 is Sign In on the password page AND Yes on KMSI.
+    // Wait until the password field is gone before treating it as Stay signed in.
     await this.browser.waitUntil(
       async () => {
-        try {
-          // First check if we've left Azure (login completed)
-          const url = await this.browser.getUrl();
-          if (!url.includes("microsoftonline.com") && !url.includes("login.microsoft")) {
-            console.log("[AzureLogin] Redirected away from Azure, login completed");
-            return true; // Exit the wait - login is done
-          }
-          
-          // Check if stay signed in prompt appeared
-          const noButton = await this.browser.$(AZURE_SELECTORS.buttonStaySignedInNo);
-          const yesButton = await this.browser.$(AZURE_SELECTORS.buttonStaySignedInYes);
-          return (await noButton.isDisplayed()) || (await yesButton.isDisplayed());
-        } catch {
-          return false;
-        }
+        if (!(await this.isOnAzureLoginPage())) return true;
+        return !(await this.isPasswordFieldDisplayed());
       },
-      { timeout: AZURE_TIMEOUTS.element, interval: AZURE_TIMEOUTS.interval }
+      { timeout: AZURE_TIMEOUTS.element, interval: AZURE_TIMEOUTS.interval },
     ).catch(() => {
-      console.log("[AzureLogin] 'Stay signed in' prompt not shown or page already closed");
+      console.log("[AzureLogin] Password page still visible after Sign In");
     });
 
-    // Only try to click if still on Azure
-    const stillOnAzureAfterWait = await this.isOnAzureLoginPage();
-    if (stillOnAzureAfterWait) {
-      // Handle stay signed in prompt
-      if (staySignedIn) {
-        await this.tryClick(AZURE_SELECTORS.buttonStaySignedInYes, AZURE_TIMEOUTS.optional);
-      } else {
-        await this.tryClick(AZURE_SELECTORS.buttonStaySignedInNo, AZURE_TIMEOUTS.optional);
-      }
+    if (!(await this.isOnAzureLoginPage())) {
+      console.log("[AzureLogin] Redirected away from Azure, login completed");
+      console.log("[AzureLogin] Login flow completed");
+      return;
+    }
+
+    if (await this.isPasswordFieldDisplayed()) {
+      const err = await this.getErrorMessage();
+      throw new Error(
+        `[AzureLogin] Still on password page after Sign In${err ? `: ${err}` : ""}`,
+      );
+    }
+
+    console.log("[AzureLogin] Still on Azure - checking for 'Stay signed in' prompt...");
+    if (staySignedIn) {
+      await this.tryClick(AZURE_SELECTORS.buttonStaySignedInYes, AZURE_TIMEOUTS.optional);
+    } else {
+      await this.tryClick(AZURE_SELECTORS.buttonStaySignedInNo, AZURE_TIMEOUTS.optional);
     }
 
     console.log("[AzureLogin] Login flow completed");
+  }
+
+  private async isPasswordFieldDisplayed(): Promise<boolean> {
+    try {
+      const passwordInput = await this.browser.$(AZURE_SELECTORS.inputPassword);
+      return await passwordInput.isDisplayed();
+    } catch {
+      return false;
+    }
   }
 
   /**
