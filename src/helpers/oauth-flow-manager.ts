@@ -773,19 +773,6 @@ export class OAuthFlowManager {
     return this.tapIosAny(names);
   }
 
-  private async dumpNativePageHints(reason: string): Promise<void> {
-    try {
-      const xml = await this.browser.getPageSource();
-      const names = [...xml.matchAll(/\b(?:name|label)="([^"]+)"/g)].map((m) => m[1]);
-      const unique = [...new Set(names)].filter(Boolean).slice(0, 80);
-      console.log(
-        `[OAuthFlowManager] iOS page names (${reason}): ${JSON.stringify(unique)}`,
-      );
-    } catch (e) {
-      console.log(`[OAuthFlowManager] iOS page source dump failed: ${e}`);
-    }
-  }
-
   private async dumpNativeButtons(reason: string): Promise<void> {
     try {
       const buttons = await this.browser.$$("XCUIElementTypeButton");
